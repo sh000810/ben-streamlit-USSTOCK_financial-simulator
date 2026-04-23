@@ -319,32 +319,6 @@ def load_positions(source: BytesIO | StringIO | str | Path) -> Tuple[pd.DataFram
     return result.reset_index(drop=True), missing
 
 
-
-def load_business_income_projection(source: BytesIO | str | Path, sheet_name: str = "預測未來十年稅後淨利表") -> Tuple[List[float], pd.DataFrame]:
-    """Read legacy 妥妥租 projection Excel and return annual net-profit list + preview table."""
-    try:
-        df = pd.read_excel(source, sheet_name=sheet_name)
-    except Exception:
-        return [], pd.DataFrame(columns=["year", "net_profit_twd"])
-
-    year_col = next((c for c in df.columns if "年份" in str(c) or "Year" in str(c)), None)
-    profit_col = next((c for c in df.columns if "稅後淨利" in str(c) or "Net Profit" in str(c)), None)
-    if year_col is None or profit_col is None:
-        return [], pd.DataFrame(columns=["year", "net_profit_twd"])
-
-    preview = df[[year_col, profit_col]].copy()
-    preview.columns = ["year", "net_profit_twd"]
-    preview["year"] = preview["year"].map(_clean_numeric).astype(int)
-    preview["net_profit_twd"] = preview["net_profit_twd"].map(_clean_numeric)
-    preview = (
-        preview.groupby("year", as_index=False)["net_profit_twd"]
-        .sum()
-        .sort_values("year")
-        .reset_index(drop=True)
-    )
-    return preview["net_profit_twd"].tolist(), preview
-
-
 def build_recommended_portfolio() -> pd.DataFrame:
     rows = []
     for ticker, weight in RECOMMENDED_WEIGHTS.items():
@@ -376,53 +350,6 @@ def normalize_weights(df: pd.DataFrame, weight_col: str = "weight_pct") -> pd.Da
         return df
     df.loc[included, weight_col] = df.loc[included, weight_col].clip(lower=0) / total * 100
     return df
-
-
-def apply_cash_reserve_target(df: pd.DataFrame, cash_target_pct: float) -> pd.DataFrame:
-    work = normalize_weights(df.copy())
-    if work.empty:
-        return work
-
-    cash_target_pct = float(max(0.0, min(100.0, cash_target_pct)))
-    if "include" not in work.columns:
-        work["include"] = True
-    included_mask = work["include"].fillna(True)
-    cash_mask = included_mask & work["ticker"].astype(str).str.upper().isin(["CASH", "CASH & CASH INVESTMENTS"])
-
-    non_cash_total = work.loc[included_mask & ~cash_mask, "weight_pct"].clip(lower=0).sum()
-    if cash_mask.any():
-        work.loc[cash_mask, "weight_pct"] = 0.0
-        if cash_mask.sum() > 1:
-            first_idx = work.index[cash_mask][0]
-            work = work.loc[~cash_mask | (work.index == first_idx)].copy()
-            cash_mask = work.index == first_idx
-    else:
-        cls = classify_ticker("Cash", "cash")
-        cash_row = {
-            "ticker": "Cash",
-            "name": "Cash",
-            "weight_pct": 0.0,
-            "asset_class": cls["asset_class"],
-            "theme": cls["theme"],
-            "role_bucket": cls["role_bucket"],
-            "risk_group": cls["risk_group"],
-            "ai_direct": bool(cls["ai_direct"]),
-            "expected_return_pct": float(cls["expected_return_pct"]),
-            "volatility_pct": float(cls["volatility_pct"]),
-            "sell_priority": int(cls["sell_priority"]),
-            "include": True,
-        }
-        work = pd.concat([work, pd.DataFrame([cash_row])], ignore_index=True)
-        cash_mask = work["ticker"].astype(str).str.upper().eq("CASH")
-
-    remaining_pct = max(0.0, 100.0 - cash_target_pct)
-    if non_cash_total > 0:
-        scale = remaining_pct / non_cash_total
-        work.loc[included_mask & ~cash_mask, "weight_pct"] = work.loc[included_mask & ~cash_mask, "weight_pct"].clip(lower=0) * scale
-    else:
-        work.loc[included_mask & ~cash_mask, "weight_pct"] = 0.0
-    work.loc[cash_mask, "weight_pct"] = cash_target_pct
-    return normalize_weights(work)
 
 
 def portfolio_to_sim_input(df: pd.DataFrame, start_assets_twd: float) -> pd.DataFrame:
@@ -673,33 +600,393 @@ def education_cost_for_year(calendar_year: int, phase_1_annual: float, phase_2_a
     return 0.0
 
 
-def compute_salary_income(year_idx: int, age: int, salary_annual: float, salary_growth_pct: float, retirement_age: int) -> float:
-    growth = salary_growth_pct / 100.0
+def simulate_portfolio(
+    portfolio_df: pd.DataFrame,
+    scenario: pd.Series,
+    years: int,
+    start_assets_twd: float,
+    start_age: int,
+    current_year: int,
+    business_profit_annual: float,
+    business_decay_pct: float,
+    living_expense_annual: float,
+    inflation_pct: float,
+    edu_phase1_annual: float,
+    edu_phase2_annual: float,
+    mortgage_annual: float,
+    inheritance_age: int,
+    inherited_rent_monthly: float,
+    withdrawal_strategy: str,
+    rebalance_frequency_years: int,
+    mode_override: Optional[str],
+    seed: int = 42,
+) -> pd.DataFrame:
+    holdings = portfolio_to_sim_input(portfolio_df, start_assets_twd)
+    if holdings.empty:
+        return pd.DataFrame()
+
+    rng = np.random.default_rng(seed)
+    peak_assets = start_assets_twd
+    ruin_year = None
+    records = []
+
+    for year_idx in range(1, years + 1):
+        cal_year = current_year + year_idx - 1
+        age = start_age + year_idx - 1
+        start_total_assets = float(holdings["value_twd"].sum())
+        start_cash = float(holdings.loc[holdings["asset_class"] == "Cash", "value_twd"].sum())
+
+        market_z = rng.standard_normal()
+        group_zs = {group: rng.standard_normal() for group in set(holdings["risk_group"].tolist())}
+        returns = []
+        for _, row in holdings.iterrows():
+            returns.append(_calc_return_for_row(row, scenario, year_idx, mode_override, rng, market_z, group_zs))
+        holdings["annual_return"] = returns
+        holdings["value_twd"] = holdings["value_twd"] * (1.0 + holdings["annual_return"])
+
+        end_before_cashflow = float(holdings["value_twd"].sum())
+        portfolio_return_pct = (end_before_cashflow / start_total_assets - 1.0) * 100 if start_total_assets > 0 else 0.0
+
+        effective_business_decay = float(scenario.get("business_decay_pct", business_decay_pct)) / 100.0
+        business_income = max(0.0, business_profit_annual * ((1.0 - effective_business_decay) ** (year_idx - 1)))
+        effective_inflation = float(scenario.get("inflation_pct", inflation_pct)) / 100.0
+        living_expense = living_expense_annual * ((1.0 + effective_inflation) ** (year_idx - 1))
+        education = education_cost_for_year(cal_year, edu_phase1_annual, edu_phase2_annual) * float(scenario.get("education_multiplier", 1.0))
+        inheritance_income = inherited_rent_monthly * 12.0 if age >= inheritance_age else 0.0
+        total_income = business_income + inheritance_income
+        total_expense = living_expense + education + mortgage_annual
+        net_cashflow = total_income - total_expense
+        withdrawal = 0.0
+        leftover_deficit = 0.0
+
+        if net_cashflow >= 0:
+            cash_mask = holdings["asset_class"] == "Cash"
+            if cash_mask.any():
+                first_cash_idx = holdings.index[cash_mask][0]
+                holdings.at[first_cash_idx, "value_twd"] += net_cashflow
+            else:
+                cash_row = pd.DataFrame(
+                    [{
+                        "ticker": "Cash",
+                        "name": "Cash",
+                        "asset_class": "Cash",
+                        "theme": "Cash",
+                        "role_bucket": "安全墊",
+                        "risk_group": "cash",
+                        "ai_direct": False,
+                        "expected_return": 0.015,
+                        "volatility": 0.0,
+                        "weight": 0.0,
+                        "value_twd": net_cashflow,
+                        "sell_priority": 0,
+                        "annual_return": 0.0,
+                    }]
+                )
+                holdings = pd.concat([holdings, cash_row], ignore_index=True)
+        else:
+            withdrawal = -net_cashflow
+            holdings, leftover_deficit = _apply_withdrawal_strategy(holdings, withdrawal, withdrawal_strategy)
+
+        holdings = maybe_rebalance(holdings, rebalance_frequency_years, year_idx)
+        end_total_assets = float(max(0.0, holdings["value_twd"].sum()))
+        end_cash = float(holdings.loc[holdings["asset_class"] == "Cash", "value_twd"].sum())
+        peak_assets = max(peak_assets, end_total_assets)
+        drawdown_pct = (end_total_assets / peak_assets - 1.0) * 100 if peak_assets > 0 else 0.0
+        min_cash_buffer_months = end_cash / (total_expense / 12.0) if total_expense > 0 else 0.0
+
+        if ruin_year is None and (end_total_assets <= 0 or leftover_deficit > 0):
+            ruin_year = cal_year
+
+        records.append(
+            {
+                "year_index": year_idx,
+                "calendar_year": cal_year,
+                "age": age,
+                "start_assets_twd": start_total_assets,
+                "portfolio_return_pct": portfolio_return_pct,
+                "end_before_cashflow_twd": end_before_cashflow,
+                "business_income_twd": business_income,
+                "inheritance_income_twd": inheritance_income,
+                "living_expense_twd": living_expense,
+                "education_expense_twd": education,
+                "mortgage_expense_twd": mortgage_annual,
+                "total_income_twd": total_income,
+                "total_expense_twd": total_expense,
+                "net_cashflow_twd": net_cashflow,
+                "withdrawal_twd": withdrawal,
+                "uncovered_deficit_twd": leftover_deficit,
+                "end_cash_twd": end_cash,
+                "end_assets_twd": end_total_assets,
+                "drawdown_pct": drawdown_pct,
+                "cash_buffer_months": min_cash_buffer_months,
+                "ruin_flag": 1 if ruin_year is not None else 0,
+            }
+        )
+
+    result = pd.DataFrame(records)
+    result["ruin_year"] = ruin_year
+    return result
+
+
+def summarize_simulation(result: pd.DataFrame, start_assets_twd: float) -> Dict[str, float]:
+    if result.empty:
+        return {}
+    final_assets = float(result.iloc[-1]["end_assets_twd"])
+    ruin_year = result.iloc[-1]["ruin_year"]
+    max_drawdown = float(result["drawdown_pct"].min())
+    worst_year = float(result["portfolio_return_pct"].min())
+    ten_year_assets = float(result.loc[result["year_index"] == 10, "end_assets_twd"].iloc[0]) if (result["year_index"] == 10).any() else np.nan
+    twenty_year_assets = float(result.loc[result["year_index"] == 20, "end_assets_twd"].iloc[0]) if (result["year_index"] == 20).any() else np.nan
+    deficit_years = int((result["net_cashflow_twd"] < 0).sum())
+    min_cash_buffer = float(result["cash_buffer_months"].min())
+
+    ruin_component = 1.0 if pd.isna(ruin_year) else max(0.0, 1.0 - ((ruin_year - CURRENT_YEAR + 1) / max(1, result["year_index"].max())))
+    drawdown_component = max(0.0, 1.0 - abs(max_drawdown) / 60.0)
+    growth_component = min(1.0, final_assets / max(start_assets_twd, 1.0) / 2.0)
+    buffer_component = min(1.0, min_cash_buffer / 12.0)
+    cashflow_component = max(0.0, 1.0 - deficit_years / max(1, result.shape[0]))
+    life_fit_score = round(100 * (0.35 * ruin_component + 0.20 * drawdown_component + 0.20 * growth_component + 0.15 * buffer_component + 0.10 * cashflow_component), 1)
+
+    return {
+        "最終資產終值": final_assets,
+        "資產耗盡年份": ruin_year if not pd.isna(ruin_year) else None,
+        "最大回撤 %": max_drawdown,
+        "年度虧損最深值 %": worst_year,
+        "10 年後淨資產": ten_year_assets,
+        "20 年後淨資產": twenty_year_assets,
+        "最低現金緩衝（月）": min_cash_buffer,
+        "人生適配分數": life_fit_score,
+    }
+
+
+def run_monte_carlo_compare(
+    current_portfolio: pd.DataFrame,
+    recommended_portfolio: pd.DataFrame,
+    scenario: pd.Series,
+    years: int,
+    start_assets_twd: float,
+    start_age: int,
+    current_year: int,
+    business_profit_annual: float,
+    business_decay_pct: float,
+    living_expense_annual: float,
+    inflation_pct: float,
+    edu_phase1_annual: float,
+    edu_phase2_annual: float,
+    mortgage_annual: float,
+    inheritance_age: int,
+    inherited_rent_monthly: float,
+    withdrawal_strategy: str,
+    rebalance_frequency_years: int,
+    mode_override: Optional[str],
+    simulations: int = 300,
+    seed: int = 42,
+) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    rows = []
+    for i in range(simulations):
+        current_result = simulate_portfolio(
+            current_portfolio,
+            scenario,
+            years,
+            start_assets_twd,
+            start_age,
+            current_year,
+            business_profit_annual,
+            business_decay_pct,
+            living_expense_annual,
+            inflation_pct,
+            edu_phase1_annual,
+            edu_phase2_annual,
+            mortgage_annual,
+            inheritance_age,
+            inherited_rent_monthly,
+            withdrawal_strategy,
+            rebalance_frequency_years,
+            mode_override,
+            seed + i,
+        )
+        rec_result = simulate_portfolio(
+            recommended_portfolio,
+            scenario,
+            years,
+            start_assets_twd,
+            start_age,
+            current_year,
+            business_profit_annual,
+            business_decay_pct,
+            living_expense_annual,
+            inflation_pct,
+            edu_phase1_annual,
+            edu_phase2_annual,
+            mortgage_annual,
+            inheritance_age,
+            inherited_rent_monthly,
+            withdrawal_strategy,
+            rebalance_frequency_years,
+            mode_override,
+            seed + i,
+        )
+        cur_summary = summarize_simulation(current_result, start_assets_twd)
+        rec_summary = summarize_simulation(rec_result, start_assets_twd)
+        rows.append(
+            {
+                "simulation": i + 1,
+                "current_final_assets_twd": cur_summary.get("最終資產終值", np.nan),
+                "recommended_final_assets_twd": rec_summary.get("最終資產終值", np.nan),
+                "current_ruin": 0 if cur_summary.get("資產耗盡年份") is None else 1,
+                "recommended_ruin": 0 if rec_summary.get("資產耗盡年份") is None else 1,
+                "current_max_drawdown_pct": cur_summary.get("最大回撤 %", np.nan),
+                "recommended_max_drawdown_pct": rec_summary.get("最大回撤 %", np.nan),
+            }
+        )
+    sims = pd.DataFrame(rows)
+    metrics = {
+        "A 方案勝過 B 方案的機率": float((sims["current_final_assets_twd"] > sims["recommended_final_assets_twd"]).mean() * 100.0),
+        "B 方案勝過 A 方案的機率": float((sims["recommended_final_assets_twd"] > sims["current_final_assets_twd"]).mean() * 100.0),
+        "Current 資產耗盡機率": float((sims["current_ruin"] == 1).mean() * 100.0),
+        "Recommended 資產耗盡機率": float((sims["recommended_ruin"] == 1).mean() * 100.0),
+        "Current 終值中位數": float(sims["current_final_assets_twd"].median()),
+        "Recommended 終值中位數": float(sims["recommended_final_assets_twd"].median()),
+    }
+    return sims, metrics
+
+
+def default_control_values(uploaded_total_usd: Optional[float], fx_rate: float) -> Dict[str, float]:
+    start_assets = uploaded_total_usd * fx_rate if uploaded_total_usd else 16_500_000.0
+    return {
+        "start_assets_twd": float(start_assets),
+        "fx_rate": fx_rate,
+        "business_profit_annual": 3_000_000.0,
+        "business_decay_pct": 10.0,
+        "living_expense_annual": 1_650_000.0,
+        "inflation_pct": 2.5,
+        "edu_phase1_annual": 750_000.0,
+        "edu_phase2_annual": 1_500_000.0,
+        "mortgage_annual": 270_000.0,
+        "inheritance_age": 62,
+        "inherited_rent_monthly": 60_000.0,
+        "simulation_years": 20,
+        "rebalance_frequency_years": 1,
+        "cash_reserve_target_pct": 8.0,
+    }
+
+
+def metric_table(metrics: Dict[str, float], label: str) -> pd.DataFrame:
+    rows = []
+    for k, v in metrics.items():
+        rows.append({"portfolio": label, "metric": k, "value": v})
+    return pd.DataFrame(rows)
+
+
+# ===== v5 overrides: income engines + Excel projection =====
+
+def load_business_income_projection(source: BytesIO | str | Path) -> Tuple[List[float], pd.DataFrame]:
+    """
+    Read 妥妥租 business income projection from xlsx.
+    Expected sheet name: 預測未來十年稅後淨利表
+    Returns (annual net profit list, preview dataframe)
+    """
+    try:
+        xl = pd.ExcelFile(source)
+    except Exception:
+        return [], pd.DataFrame(columns=["year", "net_profit_twd"])
+
+    target_sheet = None
+    preferred = ["預測未來十年稅後淨利表", "預測未來十年稅後淨利", "稅後淨利", "Sheet1"]
+    for cand in preferred:
+        if cand in xl.sheet_names:
+            target_sheet = cand
+            break
+    if target_sheet is None:
+        target_sheet = xl.sheet_names[0]
+
+    try:
+        raw = xl.parse(target_sheet)
+    except Exception:
+        return [], pd.DataFrame(columns=["year", "net_profit_twd"])
+
+    raw = raw.copy()
+    raw.columns = [str(c).strip() for c in raw.columns]
+    year_col, profit_col = None, None
+    for c in raw.columns:
+        low = c.lower()
+        if year_col is None and ("年" in c or "year" in low):
+            year_col = c
+        if profit_col is None and (("稅後" in c and "利" in c) or "net profit" in low or ("profit" in low and "gross" not in low)):
+            profit_col = c
+    if year_col is None or profit_col is None:
+        if raw.shape[1] >= 2:
+            year_col = raw.columns[0]
+            profit_col = raw.columns[1]
+        else:
+            return [], pd.DataFrame(columns=["year", "net_profit_twd"])
+
+    df = pd.DataFrame({
+        "year": pd.to_numeric(raw[year_col], errors="coerce"),
+        "net_profit_twd": raw[profit_col].map(_clean_numeric),
+    }).dropna(subset=["year"])
+    if df.empty:
+        return [], pd.DataFrame(columns=["year", "net_profit_twd"])
+    df["year"] = df["year"].astype(int)
+    df = df.groupby("year", as_index=False)["net_profit_twd"].sum().sort_values("year").reset_index(drop=True)
+    return df["net_profit_twd"].tolist(), df
+
+
+def default_control_values(uploaded_total_usd: Optional[float], fx_rate: float) -> Dict[str, float]:
+    start_assets = uploaded_total_usd * fx_rate if uploaded_total_usd else 16_500_000.0
+    return {
+        "start_assets_twd": float(start_assets),
+        "fx_rate": fx_rate,
+        "salary_annual": 1_200_000.0,
+        "salary_growth_pct": 2.0,
+        "retirement_age": 65,
+        "tuotuozu_base_annual": 3_000_000.0,
+        "tuotuozu_decay_pct": 10.0,
+        "living_expense_annual": 1_650_000.0,
+        "inflation_pct": 2.5,
+        "edu_phase1_annual": 750_000.0,
+        "edu_phase2_annual": 1_500_000.0,
+        "mortgage_annual": 270_000.0,
+        "inheritance_age": 62,
+        "inherited_rent_monthly": 60_000.0,
+        "simulation_years": 20,
+        "rebalance_frequency_years": 1,
+        "cash_reserve_target_pct": 8.0,
+        "monte_carlo_sims": 500,
+    }
+
+
+def _salary_income_for_year(salary_annual: float, growth_pct: float, start_age: int, retirement_age: int, year_idx: int) -> float:
+    age = start_age + year_idx - 1
     if age >= retirement_age:
         return 0.0
+    growth = growth_pct / 100.0
     return max(0.0, salary_annual * ((1.0 + growth) ** (year_idx - 1)))
 
 
-def compute_tuotuozu_income(
+def _tuotuozu_income_for_year(
     year_idx: int,
-    mode: str,
     base_annual: float,
     decay_pct: float,
-    income_list: Optional[List[float]],
+    mode: str,
+    projection_list: Optional[List[float]] = None,
     fallback_mode: str = "continue_decay_from_last_value",
 ) -> float:
-    items = income_list or []
-    if mode == "excel_projection":
-        if year_idx - 1 < len(items):
-            return max(0.0, float(items[year_idx - 1]))
+    projection_list = projection_list or []
+    if mode == "Excel 預測":
+        if year_idx <= len(projection_list):
+            return max(0.0, float(projection_list[year_idx - 1]))
         if fallback_mode == "zero_after_list_end":
             return 0.0
-        if len(items) == 0:
-            return 0.0
-        last = float(items[-1])
-        extra_years = year_idx - len(items)
-        return max(0.0, last * ((1.0 + decay_pct / 100.0) ** extra_years))
-    return max(0.0, base_annual * ((1.0 + decay_pct / 100.0) ** (year_idx - 1)))
+        if len(projection_list) == 0:
+            decay = decay_pct / 100.0
+            return max(0.0, base_annual * ((1.0 - decay) ** (year_idx - 1)))
+        last_value = float(projection_list[-1])
+        decay = decay_pct / 100.0
+        extra_years = year_idx - len(projection_list)
+        return max(0.0, last_value * ((1.0 - decay) ** extra_years))
+    decay = decay_pct / 100.0
+    return max(0.0, base_annual * ((1.0 - decay) ** (year_idx - 1)))
 
 
 def simulate_portfolio(
@@ -715,7 +1002,7 @@ def simulate_portfolio(
     tuotuozu_mode: str,
     tuotuozu_base_annual: float,
     tuotuozu_decay_pct: float,
-    tuotuozu_income_list: Optional[List[float]],
+    tuotuozu_projection_list: Optional[List[float]],
     tuotuozu_fallback_mode: str,
     living_expense_annual: float,
     inflation_pct: float,
@@ -745,55 +1032,59 @@ def simulate_portfolio(
 
         market_z = rng.standard_normal()
         group_zs = {group: rng.standard_normal() for group in set(holdings["risk_group"].tolist())}
-        holdings["annual_return"] = [
-            _calc_return_for_row(row, scenario, year_idx, mode_override, rng, market_z, group_zs)
-            for _, row in holdings.iterrows()
-        ]
+        returns = []
+        for _, row in holdings.iterrows():
+            returns.append(_calc_return_for_row(row, scenario, year_idx, mode_override, rng, market_z, group_zs))
+        holdings["annual_return"] = returns
         holdings["value_twd"] = holdings["value_twd"] * (1.0 + holdings["annual_return"])
+
         end_before_cashflow = float(holdings["value_twd"].sum())
         portfolio_return_pct = (end_before_cashflow / start_total_assets - 1.0) * 100 if start_total_assets > 0 else 0.0
 
-        effective_tuotuozu_decay = float(scenario.get("business_decay_pct", tuotuozu_decay_pct))
-        effective_inflation = float(scenario.get("inflation_pct", inflation_pct))
-        salary_income = compute_salary_income(year_idx, age, salary_annual, salary_growth_pct, retirement_age)
-        tuotuozu_income = compute_tuotuozu_income(
+        salary_income = _salary_income_for_year(salary_annual, salary_growth_pct, start_age, retirement_age, year_idx)
+        effective_decay = float(scenario.get("business_decay_pct", tuotuozu_decay_pct))
+        tuotuozu_income = _tuotuozu_income_for_year(
             year_idx,
-            tuotuozu_mode,
             tuotuozu_base_annual,
-            effective_tuotuozu_decay,
-            tuotuozu_income_list,
+            effective_decay,
+            tuotuozu_mode,
+            tuotuozu_projection_list,
             tuotuozu_fallback_mode,
         )
+        effective_inflation = float(scenario.get("inflation_pct", inflation_pct)) / 100.0
+        living_expense = living_expense_annual * ((1.0 + effective_inflation) ** (year_idx - 1))
+        education = education_cost_for_year(cal_year, edu_phase1_annual, edu_phase2_annual) * float(scenario.get("education_multiplier", 1.0))
         inheritance_income = inherited_rent_monthly * 12.0 if age >= inheritance_age else 0.0
 
-        living_expense = living_expense_annual * ((1.0 + effective_inflation / 100.0) ** (year_idx - 1))
-        education = education_cost_for_year(cal_year, edu_phase1_annual, edu_phase2_annual) * float(scenario.get("education_multiplier", 1.0))
         total_income = salary_income + tuotuozu_income + inheritance_income
         total_expense = living_expense + education + mortgage_annual
         net_cashflow = total_income - total_expense
-
         withdrawal = 0.0
         leftover_deficit = 0.0
+
         if net_cashflow >= 0:
             cash_mask = holdings["asset_class"] == "Cash"
             if cash_mask.any():
-                holdings.loc[cash_mask, "value_twd"] += net_cashflow / max(1, cash_mask.sum())
+                first_cash_idx = holdings.index[cash_mask][0]
+                holdings.at[first_cash_idx, "value_twd"] += net_cashflow
             else:
-                cash_row = pd.DataFrame([{
-                    "ticker": "Cash",
-                    "name": "Cash",
-                    "asset_class": "Cash",
-                    "theme": "Cash",
-                    "role_bucket": "安全墊",
-                    "risk_group": "cash",
-                    "ai_direct": False,
-                    "expected_return": 0.015,
-                    "volatility": 0.0,
-                    "weight": 0.0,
-                    "value_twd": net_cashflow,
-                    "sell_priority": 0,
-                    "annual_return": 0.0,
-                }])
+                cash_row = pd.DataFrame(
+                    [{
+                        "ticker": "Cash",
+                        "name": "Cash",
+                        "asset_class": "Cash",
+                        "theme": "Cash",
+                        "role_bucket": "安全墊",
+                        "risk_group": "cash",
+                        "ai_direct": False,
+                        "expected_return": 0.015,
+                        "volatility": 0.0,
+                        "weight": 0.0,
+                        "value_twd": net_cashflow,
+                        "sell_priority": 0,
+                        "annual_return": 0.0,
+                    }]
+                )
                 holdings = pd.concat([holdings, cash_row], ignore_index=True)
         else:
             withdrawal = -net_cashflow
@@ -804,75 +1095,42 @@ def simulate_portfolio(
         end_cash = float(holdings.loc[holdings["asset_class"] == "Cash", "value_twd"].sum())
         peak_assets = max(peak_assets, end_total_assets)
         drawdown_pct = (end_total_assets / peak_assets - 1.0) * 100 if peak_assets > 0 else 0.0
-        cash_buffer_months = end_cash / (total_expense / 12.0) if total_expense > 0 else np.nan
+        cash_buffer_months = end_cash / (total_expense / 12.0) if total_expense > 0 else 0.0
 
         if ruin_year is None and (end_total_assets <= 0 or leftover_deficit > 0):
             ruin_year = cal_year
 
-        records.append({
-            "year_index": year_idx,
-            "calendar_year": cal_year,
-            "age": age,
-            "start_assets_twd": start_total_assets,
-            "portfolio_return_pct": portfolio_return_pct,
-            "end_before_cashflow_twd": end_before_cashflow,
-            "salary_income_twd": salary_income,
-            "tuotuozu_income_twd": tuotuozu_income,
-            "inheritance_income_twd": inheritance_income,
-            "business_income_twd": tuotuozu_income,
-            "living_expense_twd": living_expense,
-            "education_expense_twd": education,
-            "mortgage_expense_twd": mortgage_annual,
-            "total_income_twd": total_income,
-            "total_expense_twd": total_expense,
-            "net_cashflow_twd": net_cashflow,
-            "withdrawal_twd": withdrawal,
-            "uncovered_deficit_twd": leftover_deficit,
-            "end_cash_twd": end_cash,
-            "end_assets_twd": end_total_assets,
-            "drawdown_pct": drawdown_pct,
-            "cash_buffer_months": cash_buffer_months,
-            "ruin_flag": 1 if ruin_year is not None else 0,
-        })
+        records.append(
+            {
+                "year_index": year_idx,
+                "calendar_year": cal_year,
+                "age": age,
+                "start_assets_twd": start_total_assets,
+                "portfolio_return_pct": portfolio_return_pct,
+                "end_before_cashflow_twd": end_before_cashflow,
+                "salary_income_twd": salary_income,
+                "tuotuozu_income_twd": tuotuozu_income,
+                "business_income_twd": tuotuozu_income,
+                "inheritance_income_twd": inheritance_income,
+                "living_expense_twd": living_expense,
+                "education_expense_twd": education,
+                "mortgage_expense_twd": mortgage_annual,
+                "total_income_twd": total_income,
+                "total_expense_twd": total_expense,
+                "net_cashflow_twd": net_cashflow,
+                "withdrawal_twd": withdrawal,
+                "uncovered_deficit_twd": leftover_deficit,
+                "end_cash_twd": end_cash,
+                "end_assets_twd": end_total_assets,
+                "drawdown_pct": drawdown_pct,
+                "cash_buffer_months": cash_buffer_months,
+                "ruin_flag": 1 if ruin_year is not None else 0,
+            }
+        )
 
     result = pd.DataFrame(records)
     result["ruin_year"] = ruin_year
     return result
-
-
-def summarize_simulation(result: pd.DataFrame, start_assets_twd: float) -> Dict[str, float]:
-    if result.empty:
-        return {}
-    final_assets = float(result.iloc[-1]["end_assets_twd"])
-    ruin_year = result.iloc[-1]["ruin_year"]
-    max_drawdown = float(result["drawdown_pct"].min())
-    worst_year = float(result["portfolio_return_pct"].min())
-    ten_year_assets = float(result.loc[result["year_index"] == 10, "end_assets_twd"].iloc[0]) if (result["year_index"] == 10).any() else np.nan
-    twenty_year_assets = float(result.loc[result["year_index"] == 20, "end_assets_twd"].iloc[0]) if (result["year_index"] == 20).any() else np.nan
-    deficit_years = int((result["net_cashflow_twd"] < 0).sum())
-    min_cash_buffer = float(result["cash_buffer_months"].min()) if result["cash_buffer_months"].notna().any() else np.nan
-    median_assets = float(result["end_assets_twd"].median())
-    pressure_years = int((result["net_cashflow_twd"] < 0).sum())
-
-    ruin_component = 1.0 if pd.isna(ruin_year) else max(0.0, 1.0 - ((ruin_year - CURRENT_YEAR + 1) / max(1, result["year_index"].max())))
-    drawdown_component = max(0.0, 1.0 - abs(max_drawdown) / 60.0)
-    growth_component = min(1.0, final_assets / max(start_assets_twd, 1.0) / 2.0)
-    buffer_component = min(1.0, (0 if pd.isna(min_cash_buffer) else min_cash_buffer) / 12.0)
-    cashflow_component = max(0.0, 1.0 - deficit_years / max(1, result.shape[0]))
-    life_fit_score = round(100 * (0.35 * ruin_component + 0.20 * drawdown_component + 0.20 * growth_component + 0.15 * buffer_component + 0.10 * cashflow_component), 1)
-
-    return {
-        "最終資產終值": final_assets,
-        "資產耗盡年份": ruin_year if not pd.isna(ruin_year) else None,
-        "最大回撤 %": max_drawdown,
-        "年度虧損最深值 %": worst_year,
-        "10 年後淨資產": ten_year_assets,
-        "20 年後淨資產": twenty_year_assets,
-        "資產中位數結果": median_assets,
-        "現金流壓力年數": pressure_years,
-        "最低現金緩衝（月）": min_cash_buffer,
-        "人生適配分數": life_fit_score,
-    }
 
 
 def run_monte_carlo_compare(
@@ -889,7 +1147,7 @@ def run_monte_carlo_compare(
     tuotuozu_mode: str,
     tuotuozu_base_annual: float,
     tuotuozu_decay_pct: float,
-    tuotuozu_income_list: Optional[List[float]],
+    tuotuozu_projection_list: Optional[List[float]],
     tuotuozu_fallback_mode: str,
     living_expense_annual: float,
     inflation_pct: float,
@@ -909,239 +1167,38 @@ def run_monte_carlo_compare(
         current_result = simulate_portfolio(
             current_portfolio, scenario, years, start_assets_twd, start_age, current_year,
             salary_annual, salary_growth_pct, retirement_age,
-            tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, tuotuozu_income_list, tuotuozu_fallback_mode,
-            living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual,
-            mortgage_annual, inheritance_age, inherited_rent_monthly,
-            withdrawal_strategy, rebalance_frequency_years, mode_override, seed + i,
+            tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, tuotuozu_projection_list, tuotuozu_fallback_mode,
+            living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual, mortgage_annual,
+            inheritance_age, inherited_rent_monthly, withdrawal_strategy, rebalance_frequency_years, mode_override,
+            seed=seed + i * 2 + 1,
         )
-        rec_result = simulate_portfolio(
+        recommended_result = simulate_portfolio(
             recommended_portfolio, scenario, years, start_assets_twd, start_age, current_year,
             salary_annual, salary_growth_pct, retirement_age,
-            tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, tuotuozu_income_list, tuotuozu_fallback_mode,
-            living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual,
-            mortgage_annual, inheritance_age, inherited_rent_monthly,
-            withdrawal_strategy, rebalance_frequency_years, mode_override, seed + i,
+            tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, tuotuozu_projection_list, tuotuozu_fallback_mode,
+            living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual, mortgage_annual,
+            inheritance_age, inherited_rent_monthly, withdrawal_strategy, rebalance_frequency_years, mode_override,
+            seed=seed + i * 2 + 2,
         )
-        cur_summary = summarize_simulation(current_result, start_assets_twd)
-        rec_summary = summarize_simulation(rec_result, start_assets_twd)
+        current_final = float(current_result.iloc[-1]["end_assets_twd"]) if not current_result.empty else 0.0
+        recommended_final = float(recommended_result.iloc[-1]["end_assets_twd"]) if not recommended_result.empty else 0.0
+        current_ruin = int((current_result["uncovered_deficit_twd"] > 0).any() or (current_result["end_assets_twd"] <= 0).any()) if not current_result.empty else 1
+        recommended_ruin = int((recommended_result["uncovered_deficit_twd"] > 0).any() or (recommended_result["end_assets_twd"] <= 0).any()) if not recommended_result.empty else 1
         rows.append({
             "simulation": i + 1,
-            "current_final_assets_twd": cur_summary.get("最終資產終值", np.nan),
-            "recommended_final_assets_twd": rec_summary.get("最終資產終值", np.nan),
-            "current_ruin": 0 if cur_summary.get("資產耗盡年份") is None else 1,
-            "recommended_ruin": 0 if rec_summary.get("資產耗盡年份") is None else 1,
-            "current_max_drawdown_pct": cur_summary.get("最大回撤 %", np.nan),
-            "recommended_max_drawdown_pct": rec_summary.get("最大回撤 %", np.nan),
+            "current_final_assets_twd": current_final,
+            "recommended_final_assets_twd": recommended_final,
+            "current_ruin": current_ruin,
+            "recommended_ruin": recommended_ruin,
+            "recommended_beats_current": int(recommended_final > current_final),
         })
     sims = pd.DataFrame(rows)
     metrics = {
-        "A 方案勝過 B 方案的機率": float((sims["current_final_assets_twd"] > sims["recommended_final_assets_twd"]).mean() * 100.0),
-        "B 方案勝過 A 方案的機率": float((sims["recommended_final_assets_twd"] > sims["current_final_assets_twd"]).mean() * 100.0),
-        "Current 資產耗盡機率": float((sims["current_ruin"] == 1).mean() * 100.0),
-        "Recommended 資產耗盡機率": float((sims["recommended_ruin"] == 1).mean() * 100.0),
+        "A 方案勝過 B 方案的機率": float((1.0 - sims["recommended_beats_current"].mean()) * 100.0),
+        "B 方案勝過 A 方案的機率": float(sims["recommended_beats_current"].mean() * 100.0),
+        "Current 資產耗盡機率": float(sims["current_ruin"].mean() * 100.0),
+        "Recommended 資產耗盡機率": float(sims["recommended_ruin"].mean() * 100.0),
         "Current 終值中位數": float(sims["current_final_assets_twd"].median()),
         "Recommended 終值中位數": float(sims["recommended_final_assets_twd"].median()),
     }
     return sims, metrics
-
-
-def validate_weight_sum(df: pd.DataFrame, label: str) -> Dict[str, object]:
-    if df.empty:
-        return {"check": f"{label} 權重加總", "status": "FAIL", "detail": "無資料"}
-    included = df["include"] if "include" in df.columns else pd.Series(True, index=df.index)
-    raw_total = float(df.loc[included, "weight_pct"].sum())
-    norm_total = float(normalize_weights(df.copy()).loc[included, "weight_pct"].sum())
-    status = "PASS" if abs(norm_total - 100.0) < 1e-6 else "FAIL"
-    if status == "PASS" and abs(raw_total - 100.0) > 0.1:
-        status = "WARNING"
-    return {"check": f"{label} 權重加總", "status": status, "detail": f"原始 {raw_total:.2f}% / 正規化後 {norm_total:.2f}%"}
-
-
-def validate_year_sequence(result: pd.DataFrame, label: str) -> Dict[str, object]:
-    if result.empty:
-        return {"check": f"{label} 年度連續性", "status": "FAIL", "detail": "結果為空"}
-    years = result["calendar_year"].tolist()
-    expected = list(range(years[0], years[0] + len(years)))
-    status = "PASS" if years == expected else "FAIL"
-    return {"check": f"{label} 年度連續性", "status": status, "detail": f"起始 {years[0]}，終點 {years[-1]}，筆數 {len(years)}"}
-
-
-def validate_cashflow_formula(result: pd.DataFrame, label: str) -> Dict[str, object]:
-    if result.empty:
-        return {"check": f"{label} 現金流公式", "status": "FAIL", "detail": "結果為空"}
-    diff = (result["total_income_twd"] - result["total_expense_twd"] - result["net_cashflow_twd"]).abs().max()
-    status = "PASS" if diff < 1e-6 else "FAIL"
-    return {"check": f"{label} 現金流公式", "status": status, "detail": f"最大誤差 {diff:,.4f}"}
-
-
-def validate_income_engine(
-    result: pd.DataFrame,
-    salary_annual: float,
-    salary_growth_pct: float,
-    retirement_age: int,
-    tuotuozu_mode: str,
-    tuotuozu_base_annual: float,
-    tuotuozu_decay_pct: float,
-    tuotuozu_income_list: Optional[List[float]],
-    tuotuozu_fallback_mode: str,
-    scenario: pd.Series,
-) -> List[Dict[str, object]]:
-    rows = []
-    if result.empty:
-        return [{"check": "收入引擎驗證", "status": "FAIL", "detail": "結果為空"}]
-    salary_ok = True
-    samples = []
-    for _, row in result.head(min(5, len(result))).iterrows():
-        expected = compute_salary_income(int(row["year_index"]), int(row["age"]), salary_annual, salary_growth_pct, retirement_age)
-        actual = float(row["salary_income_twd"])
-        samples.append(f"{int(row['calendar_year'])}:{actual:,.0f}")
-        if abs(expected - actual) > 1e-6:
-            salary_ok = False
-    if not result.loc[result["age"] >= retirement_age, "salary_income_twd"].fillna(0).eq(0).all():
-        salary_ok = False
-    rows.append({"check": "本業收入（加薪→退休）", "status": "PASS" if salary_ok else "FAIL", "detail": "前5年樣本 " + " / ".join(samples)})
-
-    biz_ok = True
-    biz_samples = []
-    decay = float(scenario.get("business_decay_pct", tuotuozu_decay_pct))
-    for _, row in result.head(min(5, len(result))).iterrows():
-        expected = compute_tuotuozu_income(int(row["year_index"]), tuotuozu_mode, tuotuozu_base_annual, decay, tuotuozu_income_list, tuotuozu_fallback_mode)
-        actual = float(row["tuotuozu_income_twd"])
-        biz_samples.append(f"{int(row['calendar_year'])}:{actual:,.0f}")
-        if abs(expected - actual) > 1e-6:
-            biz_ok = False
-    rows.append({"check": "妥妥租收入（Excel/遞減）", "status": "PASS" if biz_ok else "FAIL", "detail": "前5年樣本 " + " / ".join(biz_samples)})
-    return rows
-
-
-def validate_education_peak(result: pd.DataFrame) -> Dict[str, object]:
-    if result.empty:
-        return {"check": "教育高峰年份", "status": "FAIL", "detail": "結果為空"}
-    early = result.loc[result["calendar_year"].between(2026, 2033), "education_expense_twd"].mean()
-    peak = result.loc[result["calendar_year"].between(2034, 2038), "education_expense_twd"].mean()
-    status = "PASS" if peak >= early else "WARNING"
-    return {"check": "教育高峰年份", "status": status, "detail": f"2026-2033 平均 {early:,.0f}；2034-2038 平均 {peak:,.0f}"}
-
-
-def validate_ruin_logic(result: pd.DataFrame, label: str) -> Dict[str, object]:
-    if result.empty:
-        return {"check": f"{label} 資產耗盡邏輯", "status": "FAIL", "detail": "結果為空"}
-    deficit_hit = bool((result["uncovered_deficit_twd"] > 0).any() or (result["end_assets_twd"] <= 0).any())
-    ruin_year = result["ruin_year"].iloc[-1]
-    if deficit_hit and pd.isna(ruin_year):
-        status = "FAIL"
-    elif (not deficit_hit) and (not pd.isna(ruin_year)):
-        status = "WARNING"
-    else:
-        status = "PASS"
-    return {"check": f"{label} 資產耗盡邏輯", "status": status, "detail": f"ruin_year={ruin_year}, deficit_hit={deficit_hit}"}
-
-
-def validate_start_assets_equal(current_result: pd.DataFrame, recommended_result: pd.DataFrame) -> Dict[str, object]:
-    if current_result.empty or recommended_result.empty:
-        return {"check": "Current / Recommended 起始資產一致", "status": "FAIL", "detail": "模擬結果為空"}
-    cur = float(current_result.iloc[0]["start_assets_twd"])
-    rec = float(recommended_result.iloc[0]["start_assets_twd"])
-    status = "PASS" if abs(cur - rec) < 1e-6 else "FAIL"
-    return {"check": "Current / Recommended 起始資產一致", "status": status, "detail": f"Current={cur:,.0f}, Recommended={rec:,.0f}"}
-
-
-def validate_scenario_switch(base_summary: Dict[str, float], alt_summary: Dict[str, float], alt_name: str) -> Dict[str, object]:
-    base_final = base_summary.get("最終資產終值", np.nan)
-    alt_final = alt_summary.get("最終資產終值", np.nan)
-    changed = not pd.isna(base_final) and not pd.isna(alt_final) and abs(base_final - alt_final) > 1e-6
-    return {"check": "情境切換有效性", "status": "PASS" if changed else "WARNING", "detail": f"切換至 {alt_name} 後終值差異 {alt_final - base_final:,.0f}"}
-
-
-def sensitivity_scan(
-    portfolio_df: pd.DataFrame,
-    scenario: pd.Series,
-    years: int,
-    start_assets_twd: float,
-    start_age: int,
-    current_year: int,
-    salary_annual: float,
-    salary_growth_pct: float,
-    retirement_age: int,
-    tuotuozu_mode: str,
-    tuotuozu_base_annual: float,
-    tuotuozu_decay_pct: float,
-    tuotuozu_income_list: Optional[List[float]],
-    tuotuozu_fallback_mode: str,
-    living_expense_annual: float,
-    inflation_pct: float,
-    edu_phase1_annual: float,
-    edu_phase2_annual: float,
-    mortgage_annual: float,
-    inheritance_age: int,
-    inherited_rent_monthly: float,
-    withdrawal_strategy: str,
-    rebalance_frequency_years: int,
-    mode_override: Optional[str],
-    seed: int = 42,
-) -> pd.DataFrame:
-    base_result = simulate_portfolio(
-        portfolio_df, scenario, years, start_assets_twd, start_age, current_year,
-        salary_annual, salary_growth_pct, retirement_age,
-        tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, tuotuozu_income_list, tuotuozu_fallback_mode,
-        living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual, mortgage_annual,
-        inheritance_age, inherited_rent_monthly, withdrawal_strategy, rebalance_frequency_years, mode_override, seed,
-    )
-    base_final = summarize_simulation(base_result, start_assets_twd).get("最終資產終值", np.nan)
-
-    variants = [
-        ("薪資成長率 +1%", {"salary_growth_pct": salary_growth_pct + 1.0}),
-        ("退休年齡 +2", {"retirement_age": retirement_age + 2}),
-        ("妥妥租衰退率 +2%", {"tuotuozu_decay_pct": tuotuozu_decay_pct + 2.0}),
-        ("基礎生活費 +10%", {"living_expense_annual": living_expense_annual * 1.10}),
-        ("通膨率 +1%", {"inflation_pct": inflation_pct + 1.0}),
-        ("教育費高峰 +10%", {"edu_phase2_annual": edu_phase2_annual * 1.10}),
-        ("起始資產 +10%", {"start_assets_twd": start_assets_twd * 1.10}),
-    ]
-    rows = []
-    for name, overrides in variants:
-        res = simulate_portfolio(
-            portfolio_df, scenario, years, overrides.get("start_assets_twd", start_assets_twd), start_age, current_year,
-            salary_annual, overrides.get("salary_growth_pct", salary_growth_pct), overrides.get("retirement_age", retirement_age),
-            tuotuozu_mode, tuotuozu_base_annual, overrides.get("tuotuozu_decay_pct", tuotuozu_decay_pct), tuotuozu_income_list, tuotuozu_fallback_mode,
-            overrides.get("living_expense_annual", living_expense_annual), overrides.get("inflation_pct", inflation_pct),
-            edu_phase1_annual, overrides.get("edu_phase2_annual", edu_phase2_annual), mortgage_annual,
-            inheritance_age, inherited_rent_monthly, withdrawal_strategy, rebalance_frequency_years, mode_override, seed,
-        )
-        final_val = summarize_simulation(res, overrides.get("start_assets_twd", start_assets_twd)).get("最終資產終值", np.nan)
-        rows.append({"parameter": name, "base_final_assets": base_final, "variant_final_assets": final_val, "delta_twd": final_val - base_final})
-    out = pd.DataFrame(rows)
-    out["abs_delta_twd"] = out["delta_twd"].abs()
-    return out.sort_values("abs_delta_twd", ascending=False).reset_index(drop=True)
-
-
-def default_control_values(uploaded_total_usd: Optional[float], fx_rate: float) -> Dict[str, float]:
-    start_assets = uploaded_total_usd * fx_rate if uploaded_total_usd else 16_500_000.0
-    return {
-        "start_assets_twd": float(start_assets),
-        "fx_rate": fx_rate,
-        "salary_annual": 1_200_000.0,
-        "salary_growth_pct": 2.0,
-        "retirement_age": 65,
-        "tuotuozu_base_annual": 3_000_000.0,
-        "tuotuozu_decay_pct": -10.0,
-        "living_expense_annual": 1_650_000.0,
-        "inflation_pct": 2.5,
-        "edu_phase1_annual": 750_000.0,
-        "edu_phase2_annual": 1_500_000.0,
-        "mortgage_annual": 270_000.0,
-        "inheritance_age": 62,
-        "inherited_rent_monthly": 60_000.0,
-        "simulation_years": 20,
-        "rebalance_frequency_years": 1,
-        "cash_reserve_target_pct": 8.0,
-        "tuotuozu_fallback_mode": "continue_decay_from_last_value",
-        "tuotuozu_mode": "manual_decay",
-    }
-
-
-def metric_table(metrics: Dict[str, float], label: str) -> pd.DataFrame:
-    rows = []
-    for k, v in metrics.items():
-        rows.append({"portfolio": label, "metric": k, "value": v})
-    return pd.DataFrame(rows)
