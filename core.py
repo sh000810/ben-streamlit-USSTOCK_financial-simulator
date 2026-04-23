@@ -352,6 +352,100 @@ def normalize_weights(df: pd.DataFrame, weight_col: str = "weight_pct") -> pd.Da
     return df
 
 
+
+
+def apply_cash_reserve_target(df: pd.DataFrame, cash_reserve_target_pct: float, weight_col: str = "weight_pct") -> pd.DataFrame:
+    """Force the included portfolio weights to keep a target cash weight.
+
+    Rules:
+    - Detect cash rows by ticker or asset_class.
+    - If no cash row exists and target > 0, create one.
+    - Adjust only included rows.
+    - Preserve relative weights among non-cash holdings.
+    """
+    work = df.copy()
+    if work.empty or weight_col not in work.columns:
+        return work
+
+    if "include" not in work.columns:
+        work["include"] = True
+
+    work[weight_col] = pd.to_numeric(work[weight_col], errors="coerce").fillna(0.0)
+    included = work["include"].fillna(False).astype(bool)
+    if not included.any():
+        return work
+
+    target = max(0.0, min(float(cash_reserve_target_pct), 100.0))
+
+    ticker = work.get("ticker", pd.Series("", index=work.index)).fillna("").astype(str).str.strip().str.upper()
+    asset_class = work.get("asset_class", pd.Series("", index=work.index)).fillna("").astype(str).str.lower()
+    cash_mask = included & (
+        ticker.isin(["CASH", "CASH & CASH INVESTMENTS"])
+        | asset_class.str.contains("cash", na=False)
+    )
+
+    if target > 0 and not cash_mask.any():
+        cls = classify_ticker("Cash", "Cash")
+        new_row = {c: pd.NA for c in work.columns}
+        new_row.update({
+            "ticker": "Cash",
+            "name": "Cash",
+            weight_col: 0.0,
+            "asset_class": cls["asset_class"],
+            "theme": cls["theme"],
+            "role_bucket": cls["role_bucket"],
+            "risk_group": cls["risk_group"],
+            "ai_direct": bool(cls["ai_direct"]),
+            "expected_return_pct": float(cls["expected_return_pct"]),
+            "volatility_pct": float(cls["volatility_pct"]),
+            "sell_priority": int(cls["sell_priority"]),
+            "include": True,
+        })
+        work = pd.concat([work, pd.DataFrame([new_row])], ignore_index=True)
+        included = work["include"].fillna(False).astype(bool)
+        ticker = work.get("ticker", pd.Series("", index=work.index)).fillna("").astype(str).str.strip().str.upper()
+        asset_class = work.get("asset_class", pd.Series("", index=work.index)).fillna("").astype(str).str.lower()
+        cash_mask = included & (
+            ticker.isin(["CASH", "CASH & CASH INVESTMENTS"])
+            | asset_class.str.contains("cash", na=False)
+        )
+
+    total_included = float(work.loc[included, weight_col].clip(lower=0).sum())
+    if total_included <= 0:
+        return work
+
+    work.loc[included, weight_col] = work.loc[included, weight_col].clip(lower=0) / total_included * 100.0
+    total_included = 100.0
+
+    current_cash = float(work.loc[cash_mask, weight_col].sum()) if cash_mask.any() else 0.0
+    non_cash_mask = included & ~cash_mask
+    current_non_cash = float(work.loc[non_cash_mask, weight_col].sum()) if non_cash_mask.any() else 0.0
+
+    if abs(current_cash - target) < 1e-9:
+        return work
+
+    # Set final cash allocation.
+    if cash_mask.any():
+        cash_indices = list(work.index[cash_mask])
+        work.loc[cash_indices, weight_col] = 0.0
+        work.loc[cash_indices[0], weight_col] = target
+
+    target_non_cash = max(0.0, total_included - target)
+    if non_cash_mask.any():
+        if current_non_cash > 0:
+            scale = target_non_cash / current_non_cash
+            work.loc[non_cash_mask, weight_col] = work.loc[non_cash_mask, weight_col] * scale
+        else:
+            # No non-cash holdings: assign all included weight to the cash row.
+            first_cash_idx = work.index[cash_mask][0] if cash_mask.any() else None
+            if first_cash_idx is not None:
+                work.loc[included, weight_col] = 0.0
+                work.loc[first_cash_idx, weight_col] = 100.0
+                return work
+
+    work = normalize_weights(work, weight_col=weight_col)
+    return work
+
 def portfolio_to_sim_input(df: pd.DataFrame, start_assets_twd: float) -> pd.DataFrame:
     work = df.copy()
     if "include" not in work.columns:
