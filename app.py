@@ -16,6 +16,7 @@ from core import (
     CURRENT_YEAR,
     apply_cash_reserve_target,
     build_comparison,
+    build_defensive_portfolio,
     build_recommended_portfolio,
     bucket_exposure,
     compute_etf_overlap,
@@ -289,6 +290,64 @@ def format_table_df(df: pd.DataFrame, pct_cols: List[str] | None = None, human_c
     return work
 
 
+def portfolio_weight_distance_pct(df_a: pd.DataFrame, df_b: pd.DataFrame) -> float:
+    a = normalize_weights(df_a[df_a.get("include", True)].copy()) if not df_a.empty else pd.DataFrame(columns=["ticker", "weight_pct"])
+    b = normalize_weights(df_b[df_b.get("include", True)].copy()) if not df_b.empty else pd.DataFrame(columns=["ticker", "weight_pct"])
+    a_map = a.set_index("ticker")["weight_pct"].to_dict() if not a.empty else {}
+    b_map = b.set_index("ticker")["weight_pct"].to_dict() if not b.empty else {}
+    tickers = sorted(set(a_map) | set(b_map))
+    if not tickers:
+        return 0.0
+    return float(sum(abs(a_map.get(t, 0.0) - b_map.get(t, 0.0)) for t in tickers) / 2.0)
+
+
+def portfolio_runtime_label(editor_key: str, default_label: str) -> str:
+    if editor_key in st.session_state:
+        return f"目前頁面編輯值（{editor_key}）"
+    return default_label
+
+
+def portfolio_context_rows(current_df: pd.DataFrame, recommended_df: pd.DataFrame, custom_df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for name, df, label in [
+        ("Current", current_df, portfolio_runtime_label("current_editor", "fallback: saved_current / current_default")),
+        ("Recommended", recommended_df, portfolio_runtime_label("recommended_editor", "fallback: saved_recommended / build_recommended_portfolio")),
+        ("Custom", custom_df, portfolio_runtime_label("custom_editor", "fallback: saved_custom / build_defensive_portfolio")),
+    ]:
+        included = df[df.get("include", True)].copy()
+        included = normalize_weights(included) if not included.empty else included
+        cash_pct = float(included.loc[included["asset_class"].astype(str).str.lower().eq("cash"), "weight_pct"].sum()) if not included.empty and "asset_class" in included.columns else 0.0
+        weighted_return = float((pd.to_numeric(included.get("expected_return_pct", 0), errors="coerce").fillna(0.0) * pd.to_numeric(included.get("weight_pct", 0), errors="coerce").fillna(0.0)).sum() / 100.0) if not included.empty else 0.0
+        weighted_vol = float((pd.to_numeric(included.get("volatility_pct", 0), errors="coerce").fillna(0.0) * pd.to_numeric(included.get("weight_pct", 0), errors="coerce").fillna(0.0)).sum() / 100.0) if not included.empty else 0.0
+        top5 = ", ".join((included.sort_values("weight_pct", ascending=False).head(5)["ticker"].astype(str).tolist())) if not included.empty else "—"
+        rows.append({
+            "方案": name,
+            "目前使用來源": label,
+            "納入筆數": int(included.shape[0]),
+            "現金%": cash_pct,
+            "加權報酬%": weighted_return,
+            "加權波動%": weighted_vol,
+            "前五大持股": top5,
+        })
+    return pd.DataFrame(rows)
+
+
+def scenario_context_df(scenario_row: pd.Series, scenario_name: str, mode_override_value: str | None) -> pd.DataFrame:
+    source_label = "目前頁面編輯值（scenario_editor）" if "scenario_editor" in st.session_state else "fallback: saved_scenarios / scenario_table"
+    return pd.DataFrame([
+        {
+            "目前情境": scenario_name,
+            "情境來源": source_label,
+            "情境模式": scenario_row.get("mode", "—"),
+            "mode_override": mode_override_value or "未覆蓋",
+            "market_shift%": float(scenario_row.get("market_return_shift_pct", 0.0)),
+            "ai_excess%": float(scenario_row.get("ai_excess_return_pct", 0.0)),
+            "vol_multiplier": float(scenario_row.get("vol_multiplier", 1.0)),
+            "max_drawdown_hint%": float(scenario_row.get("max_drawdown_hint_pct", 0.0)),
+        }
+    ])
+
+
 def build_validation_checks(current_df: pd.DataFrame, recommended_df: pd.DataFrame, custom_df: pd.DataFrame, rec_res: pd.DataFrame | None, cur_res: pd.DataFrame | None, cus_res: pd.DataFrame | None, tuotuozu_mode: str, biz_projection_list: List[float], retirement_age: int, edu_phase2_annual: float, scenario_name: str) -> pd.DataFrame:
     checks = []
     for name, df in [("Current", current_df), ("Recommended", recommended_df), ("Custom", custom_df)]:
@@ -315,12 +374,20 @@ def build_validation_checks(current_df: pd.DataFrame, recommended_df: pd.DataFra
     checks.append({"檢查項目": "Drawdown 非常態 0%", "結果": "FAIL" if drawdown_zero else "PASS", "說明": "若有波動但最大回撤長期為 0，通常代表邏輯異常。"})
     different_weights = abs(float(recommended_df.loc[recommended_df["include"], "weight_pct"].sum()) - float(custom_df.loc[custom_df["include"], "weight_pct"].sum())) >= 0 # placeholder
     same_results = False
+    near_same_results = False
+    weight_distance_pct = portfolio_weight_distance_pct(recommended_df, custom_df)
     if cus_res is not None and not cus_res.empty:
-        rec_weights = recommended_df.loc[recommended_df["include"], ["ticker", "weight_pct"]].sort_values("ticker").reset_index(drop=True)
-        cus_weights = custom_df.loc[custom_df["include"], ["ticker", "weight_pct"]].sort_values("ticker").reset_index(drop=True)
-        weights_are_different = not rec_weights.equals(cus_weights)
-        same_results = rec_res["end_assets_twd"].round(6).equals(cus_res["end_assets_twd"].round(6)) and weights_are_different
-    checks.append({"檢查項目": "Custom / Recommended 不應不同配置卻完全相同", "結果": "FAIL" if same_results else "PASS", "說明": f"情境：{scenario_name}"})
+        rec_final = float(rec_res["end_assets_twd"].iloc[-1])
+        cus_final = float(cus_res["end_assets_twd"].iloc[-1])
+        final_gap_pct = abs(rec_final - cus_final) / max(abs(rec_final), abs(cus_final), 1.0) * 100.0
+        same_results = final_gap_pct <= 0.01 and weight_distance_pct >= 1.0
+        near_same_results = final_gap_pct <= 0.50 and weight_distance_pct >= 5.0
+    result_flag = "FAIL" if same_results else ("WARNING" if near_same_results else "PASS")
+    checks.append({
+        "檢查項目": "Custom / Recommended 結果是否異常過近",
+        "結果": result_flag,
+        "說明": f"情境：{scenario_name} / 權重距離 {weight_distance_pct:.1f}% / 若配置差很多但終值差不到 0.5%，代表配置可能沒真正進模擬或模型敏感度不足。",
+    })
     ruin_missing = bool((rec_res["end_assets_twd"] < 0).any() and not (rec_res["ruin_flag"] == 1).any())
     checks.append({"檢查項目": "負資產耗盡邏輯", "結果": "FAIL" if ruin_missing else "PASS", "說明": "若資產為負，應標示耗盡年份。"})
     return pd.DataFrame(checks)
@@ -639,7 +706,7 @@ current_default = current_positions_raw[[
 
 saved_current = enrich_assumptions(df_from_saved("current_portfolio", current_default, saved))
 saved_recommended = enrich_assumptions(df_from_saved("recommended_portfolio", build_recommended_portfolio(), saved))
-saved_custom = enrich_assumptions(df_from_saved("custom_portfolio", build_recommended_portfolio(), saved))
+saved_custom = enrich_assumptions(df_from_saved("custom_portfolio", build_defensive_portfolio(), saved))
 saved_scenarios = df_from_saved("scenario_table", scenario_table(), saved)
 
 editor_cfg = {
@@ -877,6 +944,8 @@ global_settings = {
 diagnostic_summary = build_diagnostic_summary(
     scenario_name, global_settings, current_norm, recommended_norm, custom_norm, current_metrics, cur_sum, rec_sum, cus_sum, validation_df
 )
+portfolio_context_df = portfolio_context_rows(current_norm, recommended_norm, custom_norm)
+scenario_context_runtime_df = scenario_context_df(scenario_row, scenario_name, mode_override_value)
 light_log = build_full_log(
     global_settings, current_norm, recommended_norm, custom_norm, scenario_row.to_dict(),
     cur_res, rec_res, cus_res, validation_df, diagnostic_summary, []
@@ -1004,6 +1073,9 @@ with main_tabs[4]:
     try:
         st.markdown("## 假設透明化 / LOG")
         st.info("這一頁的目的不是秀漂亮圖，而是讓你看得出：每檔標的的模型假設從哪裡來、哪些是假設保守化、哪些其實資料不足。")
+        st.markdown("### 目前實際吃進模擬的配置 / 情境")
+        st.dataframe(format_table_df(portfolio_context_df, pct_cols=["現金%","加權報酬%","加權波動%"]), use_container_width=True, hide_index=True)
+        st.dataframe(format_table_df(scenario_context_runtime_df, pct_cols=["market_shift%","ai_excess%","max_drawdown_hint%"]), use_container_width=True, hide_index=True)
         audit_choice = st.selectbox("選擇要查看的假設組", ["Current", "Recommended", "Custom", "診斷摘要 / LOG"], key="audit_choice")
         audit_keep = ["ticker","name","classification_bucket","hist_10y_cagr_pct","hist_10y_source","model_return_pct","model_return_method","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct","model_vol_method","confidence","notes","updated_at"]
 
@@ -1042,6 +1114,9 @@ with main_tabs[4]:
 with main_tabs[5]:
     try:
         st.markdown("## 驗證 / 除錯")
+        st.markdown("### 目前實際吃進模擬的配置 / 情境")
+        st.dataframe(format_table_df(portfolio_context_df, pct_cols=["現金%","加權報酬%","加權波動%"]), use_container_width=True, hide_index=True)
+        st.dataframe(format_table_df(scenario_context_runtime_df, pct_cols=["market_shift%","ai_excess%","max_drawdown_hint%"]), use_container_width=True, hide_index=True)
         if validation_df.empty:
             validation_df = pd.DataFrame([{"檢查項目": "最小檢查集", "結果": "INFO", "說明": "尚未產生完整模擬結果，但權重與缺值檢查已完成。"}])
 

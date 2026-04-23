@@ -29,6 +29,21 @@ RECOMMENDED_WEIGHTS = {
     "ORCL": 2.0,
 }
 
+DEFENSIVE_CUSTOM_WEIGHTS = {
+    "Cash": 20.0,
+    "VOO": 22.0,
+    "BRK.B": 20.0,
+    "MSFT": 8.0,
+    "GOOG": 6.0,
+    "AMZN": 5.0,
+    "EQIX": 5.0,
+    "MA": 4.0,
+    "ETN": 4.0,
+    "BTI": 3.0,
+    "LMT": 2.0,
+    "ORCL": 1.0,
+}
+
 ETF_LOOKTHROUGH = {
     "QQQ": {
         "MSFT": 8.8,
@@ -342,6 +357,29 @@ def build_recommended_portfolio() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def build_defensive_portfolio() -> pd.DataFrame:
+    rows = []
+    for ticker, weight in DEFENSIVE_CUSTOM_WEIGHTS.items():
+        cls = classify_ticker(ticker)
+        rows.append(
+            {
+                "ticker": ticker,
+                "name": ticker,
+                "weight_pct": float(weight),
+                "asset_class": cls["asset_class"],
+                "theme": cls["theme"],
+                "role_bucket": cls["role_bucket"],
+                "risk_group": cls["risk_group"],
+                "ai_direct": bool(cls["ai_direct"]),
+                "expected_return_pct": float(cls["expected_return_pct"]),
+                "volatility_pct": float(cls["volatility_pct"]),
+                "sell_priority": int(cls["sell_priority"]),
+                "include": True,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def normalize_weights(df: pd.DataFrame, weight_col: str = "weight_pct") -> pd.DataFrame:
     df = df.copy()
     included = df["include"] if "include" in df.columns else pd.Series(True, index=df.index)
@@ -588,6 +626,25 @@ def get_scenario_row(scenarios: pd.DataFrame, scenario_name: str) -> pd.Series:
     if row.empty:
         return scenarios.iloc[0]
     return row.iloc[0]
+
+
+def estimate_portfolio_volatility_pct(holdings: pd.DataFrame) -> float:
+    if holdings.empty:
+        return 0.0
+    weights = pd.to_numeric(holdings.get("weight", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    vols = pd.to_numeric(holdings.get("volatility", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    groups = holdings.get("risk_group", pd.Series("other", index=holdings.index)).fillna("other").astype(str).tolist()
+    if len(weights) == 0:
+        return 0.0
+    cov = np.zeros((len(weights), len(weights)), dtype=float)
+    for i in range(len(weights)):
+        for j in range(len(weights)):
+            corr = RISK_GROUP_CORR.get(groups[i], {}).get(groups[j], 0.5)
+            cov[i, j] = vols[i] * vols[j] * corr
+    port_var = float(weights @ cov @ weights.T)
+    if port_var <= 0:
+        return 0.0
+    return float(np.sqrt(port_var) * 100.0)
 
 
 def _calc_return_for_row(row: pd.Series, scenario: pd.Series, year_index: int, mode_override: Optional[str], rng: np.random.Generator, market_z: Optional[float], group_zs: Dict[str, float]) -> float:
@@ -1134,6 +1191,16 @@ def simulate_portfolio(
 
         end_before_cashflow = float(holdings["value_twd"].sum())
         portfolio_return_pct = (end_before_cashflow / start_total_assets - 1.0) * 100 if start_total_assets > 0 else 0.0
+        portfolio_vol_estimate_pct = estimate_portfolio_volatility_pct(holdings)
+        scenario_drawdown_hint_pct = abs(float(scenario.get("max_drawdown_hint_pct", 0.0)))
+        mode_name = (mode_override or scenario.get("mode", "fixed") or "fixed").strip()
+        base_stress_factor = 0.60 if mode_name in {"fixed", "path"} else 0.35
+        stress_factor = min(0.95, base_stress_factor + scenario_drawdown_hint_pct / 200.0)
+        intrayear_trough_return_pct = min(
+            portfolio_return_pct,
+            portfolio_return_pct - portfolio_vol_estimate_pct * stress_factor,
+        )
+        intrayear_trough_assets_twd = max(0.0, start_total_assets * (1.0 + intrayear_trough_return_pct / 100.0))
 
         salary_income = _salary_income_for_year(salary_annual, salary_growth_pct, start_age, retirement_age, year_idx)
         effective_decay = float(scenario.get("business_decay_pct", tuotuozu_decay_pct))
@@ -1187,8 +1254,10 @@ def simulate_portfolio(
         holdings = maybe_rebalance(holdings, rebalance_frequency_years, year_idx)
         end_total_assets = float(max(0.0, holdings["value_twd"].sum()))
         end_cash = float(holdings.loc[holdings["asset_class"] == "Cash", "value_twd"].sum())
+        peak_assets_before_year = max(peak_assets, start_total_assets)
+        drawdown_base_assets_twd = min(end_total_assets, intrayear_trough_assets_twd)
+        drawdown_pct = (drawdown_base_assets_twd / peak_assets_before_year - 1.0) * 100 if peak_assets_before_year > 0 else 0.0
         peak_assets = max(peak_assets, end_total_assets)
-        drawdown_pct = (end_total_assets / peak_assets - 1.0) * 100 if peak_assets > 0 else 0.0
         cash_buffer_months = end_cash / (total_expense / 12.0) if total_expense > 0 else 0.0
 
         if ruin_year is None and (end_total_assets <= 0 or leftover_deficit > 0):
@@ -1201,6 +1270,9 @@ def simulate_portfolio(
                 "age": age,
                 "start_assets_twd": start_total_assets,
                 "portfolio_return_pct": portfolio_return_pct,
+                "portfolio_vol_estimate_pct": portfolio_vol_estimate_pct,
+                "intrayear_trough_assets_twd": intrayear_trough_assets_twd,
+                "drawdown_method": "peak_assets_before_year vs min(end_total_assets, intrayear_trough_assets_twd)",
                 "end_before_cashflow_twd": end_before_cashflow,
                 "salary_income_twd": salary_income,
                 "tuotuozu_income_twd": tuotuozu_income,
