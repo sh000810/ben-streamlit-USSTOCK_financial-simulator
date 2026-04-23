@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import zipfile
+from io import BytesIO
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
@@ -40,8 +42,8 @@ SAMPLE_BIZ_XLSX = DATA_DIR / "妥妥租_預測.xlsx"
 SETTINGS_PATH = DATA_DIR / "user_saved_settings.json"
 
 st.set_page_config(page_title="Ben 財務與投資模擬器", layout="wide")
-st.title("Ben 財務與投資模擬器 · 透明化驗算版 v7.5")
-st.caption("加入：Cash bucket 修正、組合加權報酬/波動、情境額外加成揭露、單一路徑與 Monte Carlo 明確分離、年度生效報酬 LOG。")
+st.title("Ben 財務與投資模擬器 · 透明化驗算版 v7.7")
+st.caption("加入：Cash bucket 修正、組合加權報酬/波動、情境額外加成揭露、單一路徑與 Monte Carlo 明確分離、年度生效報酬 LOG、AI 驗證包 ZIP 一鍵下載。")
 
 st.markdown("""
 <style>
@@ -670,6 +672,128 @@ def sanitize_for_json(obj: Any):
     return obj
 
 
+def prepare_json_download(payload: Any) -> bytes:
+    return json.dumps(sanitize_for_json(payload), ensure_ascii=False, indent=2).encode("utf-8-sig")
+
+
+def prepare_text_download(text: str) -> bytes:
+    return text.encode("utf-8-sig")
+
+
+def build_validation_bundle_zip(
+    *,
+    bundle_kind: str,
+    settings_payload: Dict[str, Any],
+    global_settings: Dict[str, Any],
+    scenario_row_dict: Dict[str, Any],
+    diagnostic_summary: str,
+    validation_df: pd.DataFrame,
+    portfolio_context_df: pd.DataFrame,
+    scenario_context_runtime_df: pd.DataFrame,
+    portfolio_effect_df: pd.DataFrame,
+    current_edited: pd.DataFrame,
+    recommended_edited: pd.DataFrame,
+    custom_edited: pd.DataFrame,
+    current_norm: pd.DataFrame,
+    recommended_norm: pd.DataFrame,
+    custom_norm: pd.DataFrame,
+    current_path_df: pd.DataFrame,
+    recommended_path_df: pd.DataFrame,
+    custom_path_df: pd.DataFrame,
+    scenario_table_df: pd.DataFrame,
+    light_log: Dict[str, Any],
+    full_log: Dict[str, Any] | None = None,
+    sims_df: pd.DataFrame | None = None,
+    mc_summary_df: pd.DataFrame | None = None,
+    mc_metrics: Dict[str, Any] | None = None,
+    matrix_df: pd.DataFrame | None = None,
+    mc_path_log_records: List[Dict[str, Any]] | None = None,
+) -> bytes:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    root = f"ben_validation_bundle_{bundle_kind}_{timestamp}"
+    bio = BytesIO()
+
+    def _writestr(zf: zipfile.ZipFile, name: str, data: bytes | str):
+        zf.writestr(f"{root}/{name}", data if isinstance(data, bytes) else str(data).encode("utf-8-sig"))
+
+    def _write_df(zf: zipfile.ZipFile, name: str, df: pd.DataFrame | None):
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return
+        _writestr(zf, name, prepare_download(df))
+
+    readme = f"""Ben 財務與投資模擬器｜AI 驗證包
+
+用途：
+- 一次打包目前畫面實際吃進模擬的主要資料
+- 提供給 AI 或人工做交叉驗證
+- 避免只看截圖猜模型
+
+這包內含：
+1. settings / global 與 scenario runtime
+2. edited 與 normalized 後的三組組合
+3. deterministic annual paths
+4. validation / diagnostic summary / logs
+5. 若有啟用重型分析，另含 Monte Carlo summary/detail
+
+包類型：{bundle_kind}
+產生時間：{timestamp}
+"""
+    manifest = {
+        "bundle_kind": bundle_kind,
+        "generated_at": timestamp,
+        "scenario_name": scenario_row_dict.get("scenario_name"),
+        "simulation_years": global_settings.get("simulation_years"),
+        "has_full_log": full_log is not None,
+        "has_mc_detail": isinstance(sims_df, pd.DataFrame) and not sims_df.empty,
+        "current_rows": int(len(current_norm)),
+        "recommended_rows": int(len(recommended_norm)),
+        "custom_rows": int(len(custom_norm)),
+        "current_path_years": int(len(current_path_df)),
+        "recommended_path_years": int(len(recommended_path_df)),
+        "custom_path_years": int(len(custom_path_df)),
+    }
+
+    with zipfile.ZipFile(bio, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        _writestr(zf, "README.txt", readme)
+        _writestr(zf, "manifest.json", prepare_json_download(manifest))
+        _writestr(zf, "logs/diagnostic_summary.txt", prepare_text_download(diagnostic_summary))
+        _writestr(zf, "logs/light_log.json", prepare_json_download(light_log))
+        if full_log is not None:
+            _writestr(zf, "logs/full_log.json", prepare_json_download(full_log))
+        if mc_metrics:
+            _writestr(zf, "logs/mc_metrics.json", prepare_json_download(mc_metrics))
+
+        _writestr(zf, "settings/settings_payload.json", prepare_json_download(settings_payload))
+        _writestr(zf, "settings/global_settings.json", prepare_json_download(global_settings))
+        _writestr(zf, "settings/scenario_runtime.json", prepare_json_download(scenario_row_dict))
+
+        _write_df(zf, "contexts/portfolio_context.csv", portfolio_context_df)
+        _write_df(zf, "contexts/scenario_context.csv", scenario_context_runtime_df)
+        _write_df(zf, "contexts/portfolio_effect.csv", portfolio_effect_df)
+        _write_df(zf, "validation/validation_checks.csv", validation_df)
+
+        _write_df(zf, "portfolios/edited/current_edited.csv", current_edited)
+        _write_df(zf, "portfolios/edited/recommended_edited.csv", recommended_edited)
+        _write_df(zf, "portfolios/edited/custom_edited.csv", custom_edited)
+        _write_df(zf, "portfolios/normalized/current_normalized.csv", current_norm)
+        _write_df(zf, "portfolios/normalized/recommended_normalized.csv", recommended_norm)
+        _write_df(zf, "portfolios/normalized/custom_normalized.csv", custom_norm)
+        _write_df(zf, "scenarios/scenario_table.csv", scenario_table_df)
+
+        _write_df(zf, "paths/current_single_path.csv", current_path_df)
+        _write_df(zf, "paths/recommended_single_path.csv", recommended_path_df)
+        _write_df(zf, "paths/custom_single_path.csv", custom_path_df)
+
+        _write_df(zf, "monte_carlo/scenario_matrix.csv", matrix_df)
+        _write_df(zf, "monte_carlo/summary.csv", mc_summary_df)
+        _write_df(zf, "monte_carlo/detail.csv", sims_df)
+        if mc_path_log_records:
+            _write_df(zf, "monte_carlo/path_replay.csv", pd.DataFrame(mc_path_log_records))
+
+    bio.seek(0)
+    return bio.getvalue()
+
+
 @st.cache_data(show_spinner=False)
 def cached_load_positions(source):
     return load_positions(source)
@@ -882,9 +1006,9 @@ with main_tabs[0]:
             human_cols=["market_value_usd", "cost_basis_usd", "unrealized_gain_usd"],
             keep_cols=DISPLAY_COLS_CURRENT,
         )
-        st.dataframe(current_readable, use_container_width=True, hide_index=True)
+        st.dataframe(current_readable, width="stretch", hide_index=True)
         with st.expander("進階編輯 Current 欄位", expanded=False):
-            current_edited = st.data_editor(saved_current[DISPLAY_COLS_CURRENT + ["theme","risk_group","sell_priority"]], hide_index=True, use_container_width=True, num_rows="fixed", column_config=editor_cfg, key="current_editor")
+            current_edited = st.data_editor(saved_current[DISPLAY_COLS_CURRENT + ["theme","risk_group","sell_priority"]], hide_index=True, width="stretch", num_rows="fixed", column_config=editor_cfg, key="current_editor")
         current_sum = current_edited.loc[current_edited["include"], "weight_pct"].sum()
         c1,c2,c3,c4,c5 = st.columns(5)
         c1.metric("Current 權重總和", fmt_pct(current_sum, 2))
@@ -900,9 +1024,9 @@ with main_tabs[0]:
             pct_cols=["weight_pct", "hist_10y_cagr_pct", "model_return_pct", "vol_5y_weekly_pct", "vol_3y_weekly_pct", "model_vol_pct"],
             keep_cols=DISPLAY_COLS_EDITABLE,
         )
-        st.dataframe(recommended_readable, use_container_width=True, hide_index=True)
+        st.dataframe(recommended_readable, width="stretch", hide_index=True)
         with st.expander("進階編輯 Recommended 欄位", expanded=False):
-            recommended_edited = st.data_editor(saved_recommended[DISPLAY_COLS_EDITABLE + ["theme","risk_group"]], hide_index=True, use_container_width=True, num_rows="dynamic", column_config=editor_cfg, key="recommended_editor")
+            recommended_edited = st.data_editor(saved_recommended[DISPLAY_COLS_EDITABLE + ["theme","risk_group"]], hide_index=True, width="stretch", num_rows="dynamic", column_config=editor_cfg, key="recommended_editor")
         rsum = recommended_edited.loc[recommended_edited["include"], "weight_pct"].sum()
         st.metric("Recommended 權重總和", fmt_pct(rsum, 2))
     with sub_tabs[2]:
@@ -911,14 +1035,14 @@ with main_tabs[0]:
             pct_cols=["weight_pct", "hist_10y_cagr_pct", "model_return_pct", "vol_5y_weekly_pct", "vol_3y_weekly_pct", "model_vol_pct"],
             keep_cols=DISPLAY_COLS_EDITABLE,
         )
-        st.dataframe(custom_readable, use_container_width=True, hide_index=True)
+        st.dataframe(custom_readable, width="stretch", hide_index=True)
         with st.expander("進階編輯 Custom 欄位", expanded=False):
-            custom_edited = st.data_editor(saved_custom[DISPLAY_COLS_EDITABLE + ["theme","risk_group"]], hide_index=True, use_container_width=True, num_rows="dynamic", column_config=editor_cfg, key="custom_editor")
+            custom_edited = st.data_editor(saved_custom[DISPLAY_COLS_EDITABLE + ["theme","risk_group"]], hide_index=True, width="stretch", num_rows="dynamic", column_config=editor_cfg, key="custom_editor")
         csum = custom_edited.loc[custom_edited["include"], "weight_pct"].sum()
         st.metric("Custom 權重總和", fmt_pct(csum, 2))
     with sub_tabs[3]:
         comparison_df = build_comparison(current_edited, recommended_edited)
-        st.dataframe(format_table_df(comparison_df), use_container_width=True, hide_index=True)
+        st.dataframe(format_table_df(comparison_df), width="stretch", hide_index=True)
     with sub_tabs[4]:
         if tuotuozu_mode != "Excel 預測":
             st.warning("目前為「手動遞減」模式，尚未啟用 Excel 預測，因此此處不顯示 Excel 預覽。")
@@ -930,7 +1054,7 @@ with main_tabs[0]:
             st.success(f"已成功讀取 {len(biz_projection_preview)} 年妥妥租預測資料。")
             if biz_excel_diagnostics:
                 st.caption(" / ".join(biz_excel_diagnostics))
-            st.dataframe(format_table_df(biz_projection_preview, human_cols=["net_profit_twd"]), use_container_width=True, hide_index=True)
+            st.dataframe(format_table_df(biz_projection_preview, human_cols=["net_profit_twd"]), width="stretch", hide_index=True)
 
     save_col1, save_col2, save_col3 = st.columns([1,1,2])
     if save_col1.button("儲存目前設定", type="primary"):
@@ -1058,6 +1182,13 @@ light_log = build_full_log(
 )
 light_log = sanitize_for_json(light_log)
 
+sims_df = pd.DataFrame()
+mc_metrics: Dict[str, Any] = {}
+mc_summary_df = pd.DataFrame()
+matrix_df = pd.DataFrame()
+full_log_payload = st.session_state.get("full_log_payload")
+full_bundle_zip_bytes = st.session_state.get("full_bundle_zip_bytes")
+
 with main_tabs[1]:
     st.markdown("## 儀表板")
     current_metrics = compute_risk_duplicate_metrics(current_norm)
@@ -1075,15 +1206,15 @@ with main_tabs[1]:
             recommended_norm[["ticker","weight_pct"]].assign(portfolio="Recommended"),
             custom_norm[["ticker","weight_pct"]].assign(portfolio="Custom"),
         ], ignore_index=True)
-        st.plotly_chart(px.bar(alloc_long, x="ticker", y="weight_pct", color="portfolio", barmode="group", title="資產配置長條圖"), use_container_width=True)
+        st.plotly_chart(px.bar(alloc_long, x="ticker", y="weight_pct", color="portfolio", barmode="group", title="資產配置長條圖"), width="stretch")
     with c2:
         ai_long = risk_df.melt(id_vars="portfolio", value_vars=["直接 AI 曝險 %","ETF 重疊曝險 %","同跌風險程度（0-100）"], var_name="指標", value_name="數值")
-        st.plotly_chart(px.bar(ai_long, x="portfolio", y="數值", color="指標", barmode="group", title="AI / 科技集中度圖"), use_container_width=True)
-    st.dataframe(format_table_df(risk_df, pct_cols=["直接 AI 曝險 %","ETF 重疊曝險 %","單一風險主題集中度 %","類別分散度指數 %","單一持股過重程度 %"], human_cols=["同跌風險程度（0-100）"]), use_container_width=True, hide_index=True)
+        st.plotly_chart(px.bar(ai_long, x="portfolio", y="數值", color="指標", barmode="group", title="AI / 科技集中度圖"), width="stretch")
+    st.dataframe(format_table_df(risk_df, pct_cols=["直接 AI 曝險 %","ETF 重疊曝險 %","單一風險主題集中度 %","類別分散度指數 %","單一持股過重程度 %"], human_cols=["同跌風險程度（0-100）"]), width="stretch", hide_index=True)
 
 with main_tabs[2]:
     st.markdown("## 單一情境模擬")
-    scenario_df = st.data_editor(saved_scenarios, use_container_width=True, hide_index=True, num_rows="fixed", key="scenario_editor")
+    scenario_df = st.data_editor(saved_scenarios, width="stretch", hide_index=True, num_rows="fixed", key="scenario_editor")
     scenario_name = st.selectbox("選擇要展開的情境", scenario_df["scenario_name"].tolist(), help="這裡選的是情境名稱，不是持股方案。")
     mode_override = st.selectbox("模擬模式（可覆蓋情境內建模式）", ["跟隨情境", "fixed", "monte_carlo", "path"])
     mode_override_value = None if mode_override == "跟隨情境" else mode_override
@@ -1099,7 +1230,7 @@ with main_tabs[2]:
 
     st.info("這一頁是單一路徑 deterministic 模擬：適合看方向與年度曲線，但不代表機率分布真相。Monte Carlo 請看下一頁。")
     st.markdown("### 組合基礎加權報酬 / 波動 與情境額外加成")
-    st.dataframe(format_table_df(portfolio_effect_df, pct_cols=["基礎加權報酬率%","基礎加權波動率%","AI 直接曝險權重%","market_return_shift_pct","weighted_ai_excess_shift_pct","scenario_shift_pct","effective_portfolio_return_pct","effective_portfolio_vol_pct"]), use_container_width=True, hide_index=True)
+    st.dataframe(format_table_df(portfolio_effect_df, pct_cols=["基礎加權報酬率%","基礎加權波動率%","AI 直接曝險權重%","market_return_shift_pct","weighted_ai_excess_shift_pct","scenario_shift_pct","effective_portfolio_return_pct","effective_portfolio_vol_pct"]), width="stretch", hide_index=True)
 
     s1,s2,s3,s4 = st.columns(4)
     s1.metric("Current 最終資產", fmt_human(cur_sum.get("最終資產終值"), 1))
@@ -1124,7 +1255,7 @@ with main_tabs[2]:
         {"方案": "Custom", "終值": cus_sum.get("最終資產終值"), "最大回撤%": cus_sum.get("最大回撤 %"), "effective_portfolio_return_pct": float(portfolio_effect_df.loc[portfolio_effect_df["方案"].eq("Custom"), "effective_portfolio_return_pct"].iloc[0]), "effective_portfolio_vol_pct": float(portfolio_effect_df.loc[portfolio_effect_df["方案"].eq("Custom"), "effective_portfolio_vol_pct"].iloc[0])},
     ])
     st.markdown("### 單一路徑結果摘要")
-    st.dataframe(format_table_df(single_path_summary_df, pct_cols=["最大回撤%","effective_portfolio_return_pct","effective_portfolio_vol_pct"], human_cols=["終值"]), use_container_width=True, hide_index=True)
+    st.dataframe(format_table_df(single_path_summary_df, pct_cols=["最大回撤%","effective_portfolio_return_pct","effective_portfolio_vol_pct"], human_cols=["終值"]), width="stretch", hide_index=True)
 
     combo = pd.concat([
         cur_res.assign(portfolio="Current"),
@@ -1134,20 +1265,20 @@ with main_tabs[2]:
 
     viz_tabs = st.tabs(["資產成長曲線", "現金流缺口圖", "收入拆解", "最大回撤比較", "AI 分析 Prompt"])
     with viz_tabs[0]:
-        st.plotly_chart(px.line(combo, x="calendar_year", y="end_assets_twd", color="portfolio", markers=True, title="資產成長曲線"), use_container_width=True)
+        st.plotly_chart(px.line(combo, x="calendar_year", y="end_assets_twd", color="portfolio", markers=True, title="資產成長曲線"), width="stretch")
     with viz_tabs[1]:
         fig = px.bar(combo, x="calendar_year", y="net_cashflow_twd", color="portfolio", barmode="group", title="現金流缺口圖")
         fig.add_hline(y=0, line_dash="dash", line_color="red")
         fig.add_vrect(x0=2034 - 0.5, x1=2038 + 0.5, fillcolor="orange", opacity=0.12, line_width=0, annotation_text="教育費高峰")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     with viz_tabs[2]:
         income_combo = pd.concat([
             rec_res[["calendar_year","salary_income_twd","tuotuozu_income_twd","inheritance_income_twd"]].assign(portfolio="Recommended")
         ])
         income_long = income_combo.melt(id_vars=["calendar_year","portfolio"], var_name="收入來源", value_name="金額")
-        st.plotly_chart(px.bar(income_long, x="calendar_year", y="金額", color="收入來源", title="Recommended 收入拆解"), use_container_width=True)
+        st.plotly_chart(px.bar(income_long, x="calendar_year", y="金額", color="收入來源", title="Recommended 收入拆解"), width="stretch")
     with viz_tabs[3]:
-        st.plotly_chart(px.line(combo, x="calendar_year", y="drawdown_pct", color="portfolio", markers=True, title="最大回撤比較"), use_container_width=True)
+        st.plotly_chart(px.line(combo, x="calendar_year", y="drawdown_pct", color="portfolio", markers=True, title="最大回撤比較"), width="stretch")
     with viz_tabs[4]:
         ai_prompt = f"""請根據以下模擬結果，做決策型分析，而不是只重述數字。\n\n【本次情境】\n{scenario_name}\n\n【我的目標】\n1. 長期勝率\n2. 不容易中途出局\n3. 教育費高峰時可承受\n4. 大跌時不容易被迫賣股\n5. 整體人生舒服度\n\n【輸入摘要】\n- 起始流動資產: {fmt_human(start_assets_twd,1)} TWD\n- 本業年薪: {fmt_human(salary_annual,1)}\n- 薪資成長率: {fmt_pct(salary_growth_pct,1)}\n- 退休年齡: {retirement_age}\n- 妥妥租模式: {tuotuozu_mode}\n- 妥妥租目前年度淨利: {fmt_human(tuotuozu_base_annual,1)}\n- 妥妥租衰退率: {fmt_pct(tuotuozu_decay_pct,1)}\n- 妥妥租 Excel 年數: {len(biz_projection_list)}\n- 基礎生活費/年: {fmt_human(living_expense_annual,1)}\n- 教育費 2026-2033/年: {fmt_human(edu_phase1_annual,1)}\n- 教育費 2034-2038/年: {fmt_human(edu_phase2_annual,1)}\n- 房貸/年: {fmt_human(mortgage_annual,1)}\n- 現金保留比重: {fmt_pct(cash_reserve_target_pct,1)}\n\n【結果摘要】\nCurrent: 最終資產 {fmt_human(cur_sum.get('最終資產終值'),1)} / 最大回撤 {fmt_pct(cur_sum.get('最大回撤 %'),1)} / 10年後 {fmt_human(cur_sum.get('10 年後淨資產'),1)} / 20年後 {fmt_human(cur_sum.get('20 年後淨資產'),1)} / 人生適配分數 {cur_sum.get('人生適配分數')}\nRecommended: 最終資產 {fmt_human(rec_sum.get('最終資產終值'),1)} / 最大回撤 {fmt_pct(rec_sum.get('最大回撤 %'),1)} / 10年後 {fmt_human(rec_sum.get('10 年後淨資產'),1)} / 20年後 {fmt_human(rec_sum.get('20 年後淨資產'),1)} / 人生適配分數 {rec_sum.get('人生適配分數')}\nCustom: 最終資產 {fmt_human(cus_sum.get('最終資產終值'),1)} / 最大回撤 {fmt_pct(cus_sum.get('最大回撤 %'),1)} / 10年後 {fmt_human(cus_sum.get('10 年後淨資產'),1)} / 20年後 {fmt_human(cus_sum.get('20 年後淨資產'),1)} / 人生適配分數 {cus_sum.get('人生適配分數')}\n\n【請回答】\n1. 先結論：哪個方案最適合我，為什麼？\n2. 分成：事實 / 推論 / 假設\n3. 一定要分析：最大回撤、現金流缺口、資產耗盡風險、人生適配分數\n4. 指出哪個方案比較像「賺得多但難撐」\n5. 指出哪個方案比較像「賺得稍慢但比較舒服」\n6. 若看到任何數據不合理，請提醒我先回頭驗模型\n"""
         st.text_area("可直接複製給 AI 分析的 Prompt", value=ai_prompt, height=420)
@@ -1175,7 +1306,7 @@ with main_tabs[3]:
                 "Recommended 人生適配分數": rec_s.get("人生適配分數"),
             })
         matrix_df = pd.DataFrame(matrix_rows)
-        st.dataframe(format_table_df(matrix_df, pct_cols=["Current 最大回撤%","Recommended 最大回撤%"], human_cols=["Current 最終資產","Recommended 最終資產"]), use_container_width=True, hide_index=True)
+        st.dataframe(format_table_df(matrix_df, pct_cols=["Current 最大回撤%","Recommended 最大回撤%"], human_cols=["Current 最終資產","Recommended 最終資產"]), width="stretch", hide_index=True)
 
         st.info("這一頁是 Monte Carlo 機率分布：適合看 P50 / P5 worst case / 資產耗盡機率，不要和單一路徑混在一起解讀。")
         sims_df, mc_metrics = run_monte_carlo_compare(
@@ -1190,41 +1321,68 @@ with main_tabs[3]:
             {"方案": "Custom", "P50 終值": mc_metrics.get("Custom P50 終值"), "P25 終值": mc_metrics.get("Custom P25 終值"), "P75 終值": mc_metrics.get("Custom P75 終值"), "P5 Worst Case": mc_metrics.get("Custom P5 Worst Case 終值"), "資產耗盡機率%": mc_metrics.get("Custom 資產耗盡機率"), "最大回撤中位數%": mc_metrics.get("Custom 最大回撤中位數")},
         ])
         st.markdown("### Monte Carlo 結果摘要")
-        st.dataframe(format_table_df(mc_summary_df, pct_cols=["資產耗盡機率%","最大回撤中位數%"], human_cols=["P50 終值","P25 終值","P75 終值","P5 Worst Case"]), use_container_width=True, hide_index=True)
+        st.dataframe(format_table_df(mc_summary_df, pct_cols=["資產耗盡機率%","最大回撤中位數%"], human_cols=["P50 終值","P25 終值","P75 終值","P5 Worst Case"]), width="stretch", hide_index=True)
         m1,m2,m3 = st.columns(3)
         m1.metric("Recommended 勝過 Current 機率", fmt_pct(mc_metrics.get("Recommended 勝過 Current 機率"),1))
         m2.metric("Recommended 勝過 Custom 機率", fmt_pct(mc_metrics.get("Recommended 勝過 Custom 機率"),1))
         m3.metric("Current 勝過 Custom 機率", fmt_pct(mc_metrics.get("Current 勝過 Custom 機率"),1))
         long_mc = sims_df.melt(value_vars=["current_final_assets_twd","recommended_final_assets_twd","custom_final_assets_twd"], var_name="portfolio", value_name="final_assets_twd")
-        st.plotly_chart(px.histogram(long_mc, x="final_assets_twd", color="portfolio", barmode="overlay", nbins=40, title="Monte Carlo 終值分布"), use_container_width=True)
+        st.plotly_chart(px.histogram(long_mc, x="final_assets_twd", color="portfolio", barmode="overlay", nbins=40, title="Monte Carlo 終值分布"), width="stretch")
         dd_long = sims_df.melt(value_vars=["current_max_drawdown_pct","recommended_max_drawdown_pct","custom_max_drawdown_pct"], var_name="portfolio", value_name="max_drawdown_pct")
-        st.plotly_chart(px.histogram(dd_long, x="max_drawdown_pct", color="portfolio", barmode="overlay", nbins=40, title="Monte Carlo 最大回撤分布"), use_container_width=True)
+        st.plotly_chart(px.histogram(dd_long, x="max_drawdown_pct", color="portfolio", barmode="overlay", nbins=40, title="Monte Carlo 最大回撤分布"), width="stretch")
 
 with main_tabs[4]:
     try:
         st.markdown("## 假設透明化 / LOG")
         st.info("這一頁的目的不是秀漂亮圖，而是讓你看得出：每檔標的的模型假設從哪裡來、哪些是假設保守化、哪些其實資料不足。")
         st.markdown("### 目前實際吃進模擬的配置 / 情境")
-        st.dataframe(format_table_df(portfolio_context_df, pct_cols=["現金%","加權報酬%","加權波動%"]), use_container_width=True, hide_index=True)
-        st.dataframe(format_table_df(scenario_context_runtime_df, pct_cols=["market_shift%","ai_excess%","max_drawdown_hint%"]), use_container_width=True, hide_index=True)
-        st.dataframe(format_table_df(portfolio_effect_df, pct_cols=["基礎加權報酬率%","基礎加權波動率%","AI 直接曝險權重%","market_return_shift_pct","weighted_ai_excess_shift_pct","scenario_shift_pct","effective_portfolio_return_pct","effective_portfolio_vol_pct"]), use_container_width=True, hide_index=True)
+        st.dataframe(format_table_df(portfolio_context_df, pct_cols=["現金%","加權報酬%","加權波動%"]), width="stretch", hide_index=True)
+        st.dataframe(format_table_df(scenario_context_runtime_df, pct_cols=["market_shift%","ai_excess%","max_drawdown_hint%"]), width="stretch", hide_index=True)
+        st.dataframe(format_table_df(portfolio_effect_df, pct_cols=["基礎加權報酬率%","基礎加權波動率%","AI 直接曝險權重%","market_return_shift_pct","weighted_ai_excess_shift_pct","scenario_shift_pct","effective_portfolio_return_pct","effective_portfolio_vol_pct"]), width="stretch", hide_index=True)
         audit_choice = st.selectbox("選擇要查看的假設組", ["Current", "Recommended", "Custom", "診斷摘要 / LOG"], key="audit_choice")
         audit_keep = ["ticker","name","classification_bucket","hist_10y_cagr_pct","hist_10y_source","model_return_pct","model_return_method","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct","model_vol_method","confidence","notes","updated_at"]
 
         if audit_choice == "Current":
-            st.dataframe(format_table_df(current_norm, pct_cols=["hist_10y_cagr_pct","model_return_pct","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct"], keep_cols=audit_keep), use_container_width=True, hide_index=True)
+            st.dataframe(format_table_df(current_norm, pct_cols=["hist_10y_cagr_pct","model_return_pct","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct"], keep_cols=audit_keep), width="stretch", hide_index=True)
         elif audit_choice == "Recommended":
-            st.dataframe(format_table_df(recommended_norm, pct_cols=["hist_10y_cagr_pct","model_return_pct","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct"], keep_cols=audit_keep), use_container_width=True, hide_index=True)
+            st.dataframe(format_table_df(recommended_norm, pct_cols=["hist_10y_cagr_pct","model_return_pct","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct"], keep_cols=audit_keep), width="stretch", hide_index=True)
         elif audit_choice == "Custom":
-            st.dataframe(format_table_df(custom_norm, pct_cols=["hist_10y_cagr_pct","model_return_pct","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct"], keep_cols=audit_keep), use_container_width=True, hide_index=True)
+            st.dataframe(format_table_df(custom_norm, pct_cols=["hist_10y_cagr_pct","model_return_pct","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct"], keep_cols=audit_keep), width="stretch", hide_index=True)
         else:
-            d1, d2 = st.columns(2)
-            d1.download_button("下載輕量 LOG（JSON）", json.dumps(light_log, ensure_ascii=False, indent=2), "simulation_light_log.json", "application/json")
-            d2.download_button("下載診斷摘要（txt）", diagnostic_summary, "diagnostic_summary.txt", "text/plain")
+            light_bundle_zip_bytes = build_validation_bundle_zip(
+                bundle_kind="light",
+                settings_payload=settings_payload,
+                global_settings=global_settings,
+                scenario_row_dict=scenario_row.to_dict(),
+                diagnostic_summary=diagnostic_summary,
+                validation_df=validation_df,
+                portfolio_context_df=portfolio_context_df,
+                scenario_context_runtime_df=scenario_context_runtime_df,
+                portfolio_effect_df=portfolio_effect_df,
+                current_edited=current_edited,
+                recommended_edited=recommended_edited,
+                custom_edited=custom_edited,
+                current_norm=current_norm,
+                recommended_norm=recommended_norm,
+                custom_norm=custom_norm,
+                current_path_df=cur_res,
+                recommended_path_df=rec_res,
+                custom_path_df=cus_res,
+                scenario_table_df=pd.DataFrame(scenario_df),
+                light_log=light_log,
+                sims_df=sims_df,
+                mc_summary_df=mc_summary_df,
+                mc_metrics=mc_metrics,
+                matrix_df=matrix_df,
+            )
+            d1, d2, d3 = st.columns(3)
+            d1.download_button("下載輕量 LOG（JSON）", prepare_json_download(light_log), "simulation_light_log.json", "application/json")
+            d2.download_button("下載診斷摘要（txt）", prepare_text_download(diagnostic_summary), "diagnostic_summary.txt", "text/plain")
+            d3.download_button("一鍵下載 AI 驗證包 ZIP（輕量）", light_bundle_zip_bytes, f"ben_validation_bundle_light_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip", "application/zip")
             st.text_area("可直接複製的診斷摘要", diagnostic_summary, height=380)
-            st.caption("預設先提供輕量 LOG，避免一進頁就跑重型 replay。需要完整路徑再手動產生。")
-            if st.button("產生完整 LOG（較慢，含 Monte Carlo path replay）", key="gen_full_log_btn"):
-                with st.spinner("正在產生完整 LOG，這一步會比較慢..."):
+            st.caption("輕量包會一次打包：設定、情境、三組持股、年度路徑、validation、diagnostic summary、light log，以及已存在的 Monte Carlo 摘要。")
+            if st.button("產生完整 LOG / AI 驗證包（較慢，含 Monte Carlo path replay）", key="gen_full_log_btn"):
+                with st.spinner("正在產生完整 LOG 與驗證包，這一步會比較慢..."):
                     mc_path_log = build_mc_path_log(
                         scenario_row.to_dict(), df_to_records(current_norm), df_to_records(recommended_norm),
                         simulation_years, start_assets_twd, CURRENT_AGE, CURRENT_YEAR, salary_annual, salary_growth_pct,
@@ -1238,8 +1396,45 @@ with main_tabs[4]:
                         cur_res, rec_res, cus_res, validation_df, diagnostic_summary, mc_path_log
                     )
                     full_log = sanitize_for_json(full_log)
-                    st.download_button("下載完整 LOG（JSON）", json.dumps(full_log, ensure_ascii=False, indent=2), "simulation_full_log.json", "application/json", key="download_full_log_btn")
+                    full_bundle_zip_bytes = build_validation_bundle_zip(
+                        bundle_kind="full",
+                        settings_payload=settings_payload,
+                        global_settings=global_settings,
+                        scenario_row_dict=scenario_row.to_dict(),
+                        diagnostic_summary=diagnostic_summary,
+                        validation_df=validation_df,
+                        portfolio_context_df=portfolio_context_df,
+                        scenario_context_runtime_df=scenario_context_runtime_df,
+                        portfolio_effect_df=portfolio_effect_df,
+                        current_edited=current_edited,
+                        recommended_edited=recommended_edited,
+                        custom_edited=custom_edited,
+                        current_norm=current_norm,
+                        recommended_norm=recommended_norm,
+                        custom_norm=custom_norm,
+                        current_path_df=cur_res,
+                        recommended_path_df=rec_res,
+                        custom_path_df=cus_res,
+                        scenario_table_df=pd.DataFrame(scenario_df),
+                        light_log=light_log,
+                        full_log=full_log,
+                        sims_df=sims_df,
+                        mc_summary_df=mc_summary_df,
+                        mc_metrics=mc_metrics,
+                        matrix_df=matrix_df,
+                        mc_path_log_records=mc_path_log,
+                    )
+                    st.session_state["full_log_payload"] = full_log
+                    st.session_state["full_bundle_zip_bytes"] = full_bundle_zip_bytes
+                    full_log_payload = full_log
                     st.success(f"完整 LOG 已產生，含 {len(mc_path_log)} 筆 path records。")
+            full_log_payload = st.session_state.get("full_log_payload")
+            full_bundle_zip_bytes = st.session_state.get("full_bundle_zip_bytes")
+            if full_log_payload is not None:
+                f1, f2 = st.columns(2)
+                f1.download_button("下載完整 LOG（JSON）", prepare_json_download(full_log_payload), "simulation_full_log.json", "application/json", key="download_full_log_btn")
+                if full_bundle_zip_bytes is not None:
+                    f2.download_button("一鍵下載 AI 驗證包 ZIP（完整）", full_bundle_zip_bytes, f"ben_validation_bundle_full_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip", "application/zip", key="download_full_bundle_zip_btn")
             st.caption("若沒有真實 10Y / 5Y / 3Y 價格資料，系統會清楚標示 unavailable / bucket default，不假裝精準。")
     except Exception as e:
         st.error(f"假設透明化 / LOG 頁產生失敗：{e}")
@@ -1247,9 +1442,9 @@ with main_tabs[5]:
     try:
         st.markdown("## 驗證 / 除錯")
         st.markdown("### 目前實際吃進模擬的配置 / 情境")
-        st.dataframe(format_table_df(portfolio_context_df, pct_cols=["現金%","加權報酬%","加權波動%"]), use_container_width=True, hide_index=True)
-        st.dataframe(format_table_df(scenario_context_runtime_df, pct_cols=["market_shift%","ai_excess%","max_drawdown_hint%"]), use_container_width=True, hide_index=True)
-        st.dataframe(format_table_df(portfolio_effect_df, pct_cols=["基礎加權報酬率%","基礎加權波動率%","AI 直接曝險權重%","market_return_shift_pct","weighted_ai_excess_shift_pct","scenario_shift_pct","effective_portfolio_return_pct","effective_portfolio_vol_pct"]), use_container_width=True, hide_index=True)
+        st.dataframe(format_table_df(portfolio_context_df, pct_cols=["現金%","加權報酬%","加權波動%"]), width="stretch", hide_index=True)
+        st.dataframe(format_table_df(scenario_context_runtime_df, pct_cols=["market_shift%","ai_excess%","max_drawdown_hint%"]), width="stretch", hide_index=True)
+        st.dataframe(format_table_df(portfolio_effect_df, pct_cols=["基礎加權報酬率%","基礎加權波動率%","AI 直接曝險權重%","market_return_shift_pct","weighted_ai_excess_shift_pct","scenario_shift_pct","effective_portfolio_return_pct","effective_portfolio_vol_pct"]), width="stretch", hide_index=True)
         if validation_df.empty:
             validation_df = pd.DataFrame([{"檢查項目": "最小檢查集", "結果": "INFO", "說明": "尚未產生完整模擬結果，但權重與缺值檢查已完成。"}])
 
@@ -1269,7 +1464,7 @@ with main_tabs[5]:
         else:
             st.success("目前最小檢查集皆通過。")
 
-        st.dataframe(validation_df, use_container_width=True, hide_index=True)
+        st.dataframe(validation_df, width="stretch", hide_index=True)
 
         sens_rows = []
         for param, low, high, label in [
@@ -1281,28 +1476,29 @@ with main_tabs[5]:
         ]:
             sens_rows.append({"參數": label, "低值": low, "高值": high, "提醒": "這項對結果常有明顯影響，調整前後請重跑並比較圖表。"})
         st.markdown("### 最敏感 5 個參數（人工提醒版）")
-        st.dataframe(format_table_df(pd.DataFrame(sens_rows), human_cols=["低值","高值"]), use_container_width=True, hide_index=True)
+        st.dataframe(format_table_df(pd.DataFrame(sens_rows), human_cols=["低值","高值"]), width="stretch", hide_index=True)
     except Exception as e:
         st.error(f"驗證 / 除錯頁產生失敗：{e}")
 with main_tabs[6]:
 
     st.markdown("## 原始資料與下載")
+    st.info("若你要把整包資料丟給 AI 驗證，最省事的是到『5. 假設透明化 / LOG』直接按一鍵下載 AI 驗證包 ZIP。這裡則保留逐項下載。")
     raw_tabs = st.tabs(["Current 正規化後", "Recommended 正規化後", "Custom 正規化後", "情境表", "Monte Carlo 明細"])
     with raw_tabs[0]:
-        st.dataframe(format_table_df(current_norm, pct_cols=["weight_pct","hist_10y_cagr_pct","model_return_pct","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct"], human_cols=["market_value_usd","cost_basis_usd","unrealized_gain_usd"]), use_container_width=True, hide_index=True)
+        st.dataframe(format_table_df(current_norm, pct_cols=["weight_pct","hist_10y_cagr_pct","model_return_pct","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct"], human_cols=["market_value_usd","cost_basis_usd","unrealized_gain_usd"]), width="stretch", hide_index=True)
         st.download_button("下載 Current CSV", prepare_download(current_norm), "current_portfolio.csv", "text/csv")
     with raw_tabs[1]:
-        st.dataframe(format_table_df(recommended_norm, pct_cols=["weight_pct","hist_10y_cagr_pct","model_return_pct","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct"]), use_container_width=True, hide_index=True)
+        st.dataframe(format_table_df(recommended_norm, pct_cols=["weight_pct","hist_10y_cagr_pct","model_return_pct","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct"]), width="stretch", hide_index=True)
         st.download_button("下載 Recommended CSV", prepare_download(recommended_norm), "recommended_portfolio.csv", "text/csv")
     with raw_tabs[2]:
-        st.dataframe(format_table_df(custom_norm, pct_cols=["weight_pct","hist_10y_cagr_pct","model_return_pct","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct"]), use_container_width=True, hide_index=True)
+        st.dataframe(format_table_df(custom_norm, pct_cols=["weight_pct","hist_10y_cagr_pct","model_return_pct","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct"]), width="stretch", hide_index=True)
         st.download_button("下載 Custom CSV", prepare_download(custom_norm), "custom_portfolio.csv", "text/csv")
     with raw_tabs[3]:
-        st.dataframe(format_table_df(pd.DataFrame(scenario_df), pct_cols=["market_return_shift_pct","ai_excess_return_pct","early_negative_return_pct","early_ai_penalty_pct","recovery_boost_pct","max_drawdown_hint_pct"], human_cols=[]), use_container_width=True, hide_index=True)
+        st.dataframe(format_table_df(pd.DataFrame(scenario_df), pct_cols=["market_return_shift_pct","ai_excess_return_pct","early_negative_return_pct","early_ai_penalty_pct","recovery_boost_pct","max_drawdown_hint_pct"], human_cols=[]), width="stretch", hide_index=True)
         st.download_button("下載情境表 CSV", prepare_download(pd.DataFrame(scenario_df)), "scenario_table.csv", "text/csv")
     with raw_tabs[4]:
         try:
-            st.dataframe(format_table_df(sims_df, human_cols=["current_final_assets_twd","recommended_final_assets_twd"]), use_container_width=True, hide_index=True)
+            st.dataframe(format_table_df(sims_df, human_cols=["current_final_assets_twd","recommended_final_assets_twd"]), width="stretch", hide_index=True)
             st.download_button("下載 Monte Carlo 明細 CSV", prepare_download(sims_df), "mc_detail.csv", "text/csv")
         except Exception:
             st.info("請先到『情境矩陣 / Monte Carlo』頁跑一次。")

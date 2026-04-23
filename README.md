@@ -1,17 +1,26 @@
-# Ben 財務與投資模擬器 v7
+Ben 財務與投資模擬器 v7.7
 
-這版加入：
+本版新增：AI 驗證包 ZIP 一鍵下載
 
-- 全系統數字格式統一：KPI 用 K / M / B，表格用千分位
-- 假設透明化（Assumption Audit）
-- 每檔股票顯示：歷史值 / 模型值 / 方法 / 信心 / 補充說明
-- 一鍵下載完整 LOG（JSON）
-- 可直接複製的診斷摘要
-- 驗證 / 除錯頁補上最小檢查集，不再空白
-- 透明化原則：若沒有真實 10Y / 5Y / 3Y 價格資料，系統會明確標示 unavailable / bucket default，不假裝精準
+位置：
+- 5. 假設透明化 / LOG
+- 選「診斷摘要 / LOG」後可直接下載
 
-## 啟動
-```bash
-python -m pip install -r requirements.txt
-python -m streamlit run app.py
-```
+功能：
+1. 一鍵下載 AI 驗證包 ZIP（輕量）
+   內容含：
+   - settings payload / global settings / scenario runtime
+   - edited 與 normalized 三組組合
+   - single-path 年度路徑
+   - validation checks
+   - diagnostic summary
+   - light log
+   - 若已有 Monte Carlo summary/detail，也一起打包
+
+2. 產生完整 LOG / AI 驗證包（較慢）
+   - 會額外產生 Monte Carlo path replay
+   - 可下載完整 LOG JSON
+   - 可下載完整 AI 驗證包 ZIP
+
+目的：
+讓使用者可以把整包資料丟給 AI 或人工，驗證整體計算，不必只靠截圖或手動逐項下載。
