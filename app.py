@@ -514,6 +514,32 @@ def prepare_download(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
 
+def sanitize_for_json(obj: Any):
+    if isinstance(obj, dict):
+        return {str(k): sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [sanitize_for_json(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [sanitize_for_json(v) for v in obj]
+    if isinstance(obj, pd.DataFrame):
+        return sanitize_for_json(obj.to_dict(orient="records"))
+    if isinstance(obj, pd.Series):
+        return sanitize_for_json(obj.to_dict())
+    if pd.isna(obj):
+        return None
+    try:
+        import numpy as np
+        if isinstance(obj, (np.integer, np.int64, np.int32)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, (np.bool_,)):
+            return bool(obj)
+    except Exception:
+        pass
+    return obj
+
+
 @st.cache_data(show_spinner=False)
 def cached_load_positions(source):
     return load_positions(source)
@@ -653,6 +679,16 @@ DISPLAY_COLS_EDITABLE = [
     "include","ticker","name","weight_pct","asset_class","role_bucket","ai_direct","hist_10y_cagr_pct","hist_10y_source",
     "model_return_pct","model_return_method","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct","model_vol_method","confidence","notes","sell_priority"
 ]
+
+# 先給所有下游 tab 一組安全的預設值，避免因為前面 tab 尚未互動而導致空白或 NameError。
+current_edited = saved_current.copy()
+recommended_edited = saved_recommended.copy()
+custom_edited = saved_custom.copy()
+scenario_df = saved_scenarios.copy()
+default_scenario_name = scenario_df["scenario_name"].iloc[0] if not scenario_df.empty else "自訂情境"
+scenario_name = default_scenario_name
+mode_override = "跟隨情境"
+mode_override_value = None
 
 main_tabs = st.tabs(["1. 輸入與持股編輯", "2. 儀表板", "3. 單一情境模擬", "4. 情境矩陣 / Monte Carlo", "5. 假設透明化 / LOG", "6. 驗證 / 除錯", "7. 原始資料與下載"])
 
@@ -799,6 +835,54 @@ current_norm = prepare_simulation_df(apply_cash_reserve_target(normalize_weights
 recommended_norm = prepare_simulation_df(apply_cash_reserve_target(normalize_weights(recommended_edited.copy()), cash_reserve_target_pct))
 custom_norm = prepare_simulation_df(apply_cash_reserve_target(normalize_weights(custom_edited.copy()), cash_reserve_target_pct))
 
+# 先做一輪基礎計算，讓 2~7 tab 都有內容可顯示。
+current_metrics = compute_risk_duplicate_metrics(current_norm)
+recommended_metrics = compute_risk_duplicate_metrics(recommended_norm)
+custom_metrics = compute_risk_duplicate_metrics(custom_norm)
+scenario_row = get_scenario_row(pd.DataFrame(scenario_df), scenario_name)
+cur_res = simulate_portfolio(current_norm, scenario_row, simulation_years, start_assets_twd, CURRENT_AGE, CURRENT_YEAR, salary_annual, salary_growth_pct, retirement_age, tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, biz_projection_list, tuotuozu_fallback_mode, living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual, mortgage_annual, inheritance_age, inherited_rent_monthly, withdrawal_strategy, rebalance_frequency_years, mode_override_value, seed=42)
+rec_res = simulate_portfolio(recommended_norm, scenario_row, simulation_years, start_assets_twd, CURRENT_AGE, CURRENT_YEAR, salary_annual, salary_growth_pct, retirement_age, tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, biz_projection_list, tuotuozu_fallback_mode, living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual, mortgage_annual, inheritance_age, inherited_rent_monthly, withdrawal_strategy, rebalance_frequency_years, mode_override_value, seed=43)
+cus_res = simulate_portfolio(custom_norm, scenario_row, simulation_years, start_assets_twd, CURRENT_AGE, CURRENT_YEAR, salary_annual, salary_growth_pct, retirement_age, tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, biz_projection_list, tuotuozu_fallback_mode, living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual, mortgage_annual, inheritance_age, inherited_rent_monthly, withdrawal_strategy, rebalance_frequency_years, mode_override_value, seed=44)
+cur_sum = summarize_simulation(cur_res, start_assets_twd)
+rec_sum = summarize_simulation(rec_res, start_assets_twd)
+cus_sum = summarize_simulation(cus_res, start_assets_twd)
+validation_df = build_validation_checks(
+    current_edited, recommended_edited, custom_edited,
+    rec_res, cur_res, cus_res, tuotuozu_mode, biz_projection_list, retirement_age, edu_phase2_annual, scenario_name
+)
+if validation_df.empty:
+    validation_df = pd.DataFrame([{"檢查項目": "最小檢查集", "結果": "INFO", "說明": "目前尚未產生完整結果，但頁面已正常啟動。"}])
+global_settings = {
+    "fx_rate": fx_rate,
+    "start_assets_twd": start_assets_twd,
+    "simulation_years": simulation_years,
+    "rebalance_frequency_years": rebalance_frequency_years,
+    "withdrawal_strategy": withdrawal_strategy,
+    "cash_reserve_target_pct": cash_reserve_target_pct,
+    "monte_carlo_sims": monte_carlo_sims,
+    "salary_annual": salary_annual,
+    "salary_growth_pct": salary_growth_pct,
+    "retirement_age": retirement_age,
+    "tuotuozu_mode": tuotuozu_mode,
+    "tuotuozu_base_annual": tuotuozu_base_annual,
+    "tuotuozu_decay_pct": tuotuozu_decay_pct,
+    "living_expense_annual": living_expense_annual,
+    "inflation_pct": inflation_pct,
+    "edu_phase1_annual": edu_phase1_annual,
+    "edu_phase2_annual": edu_phase2_annual,
+    "mortgage_annual": mortgage_annual,
+    "inheritance_age": inheritance_age,
+    "inherited_rent_monthly": inherited_rent_monthly,
+}
+diagnostic_summary = build_diagnostic_summary(
+    scenario_name, global_settings, current_norm, recommended_norm, custom_norm, current_metrics, cur_sum, rec_sum, cus_sum, validation_df
+)
+light_log = build_full_log(
+    global_settings, current_norm, recommended_norm, custom_norm, scenario_row.to_dict(),
+    cur_res, rec_res, cus_res, validation_df, diagnostic_summary, []
+)
+light_log = sanitize_for_json(light_log)
+
 with main_tabs[1]:
     st.markdown("## 儀表板")
     current_metrics = compute_risk_duplicate_metrics(current_norm)
@@ -917,104 +1001,81 @@ with main_tabs[3]:
     st.plotly_chart(px.histogram(long_mc, x="final_assets_twd", color="portfolio", barmode="overlay", nbins=40, title="Monte Carlo 終值分布"), use_container_width=True)
 
 with main_tabs[4]:
-    st.markdown("## 假設透明化 / LOG")
-    validation_df = build_validation_checks(
-        current_edited, recommended_edited, custom_edited,
-        rec_res, cur_res, cus_res, tuotuozu_mode, biz_projection_list, retirement_age, edu_phase2_annual, scenario_name
-    )
-    if validation_df.empty:
-        validation_df = pd.DataFrame([{"檢查項目": "最小檢查集", "結果": "INFO", "說明": "目前尚未產生完整結果，但頁面已正常啟動。"}])
+    try:
+        st.markdown("## 假設透明化 / LOG")
+        st.info("這一頁的目的不是秀漂亮圖，而是讓你看得出：每檔標的的模型假設從哪裡來、哪些是假設保守化、哪些其實資料不足。")
+        audit_choice = st.selectbox("選擇要查看的假設組", ["Current", "Recommended", "Custom", "診斷摘要 / LOG"], key="audit_choice")
+        audit_keep = ["ticker","name","classification_bucket","hist_10y_cagr_pct","hist_10y_source","model_return_pct","model_return_method","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct","model_vol_method","confidence","notes","updated_at"]
 
-    st.info("這一頁的目的不是秀漂亮圖，而是讓你看得出：每檔標的的模型假設從哪裡來、哪些是假設保守化、哪些其實資料不足。")
-    audit_choice = st.selectbox("選擇要查看的假設組", ["Current", "Recommended", "Custom", "診斷摘要 / LOG"], key="audit_choice")
-    audit_keep = ["ticker","name","classification_bucket","hist_10y_cagr_pct","hist_10y_source","model_return_pct","model_return_method","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct","model_vol_method","confidence","notes","updated_at"]
-
-    global_settings = {
-        "fx_rate": fx_rate,
-        "start_assets_twd": start_assets_twd,
-        "simulation_years": simulation_years,
-        "rebalance_frequency_years": rebalance_frequency_years,
-        "withdrawal_strategy": withdrawal_strategy,
-        "cash_reserve_target_pct": cash_reserve_target_pct,
-        "monte_carlo_sims": monte_carlo_sims,
-        "salary_annual": salary_annual,
-        "salary_growth_pct": salary_growth_pct,
-        "retirement_age": retirement_age,
-        "tuotuozu_mode": tuotuozu_mode,
-        "tuotuozu_base_annual": tuotuozu_base_annual,
-        "tuotuozu_decay_pct": tuotuozu_decay_pct,
-        "living_expense_annual": living_expense_annual,
-        "inflation_pct": inflation_pct,
-        "edu_phase1_annual": edu_phase1_annual,
-        "edu_phase2_annual": edu_phase2_annual,
-        "mortgage_annual": mortgage_annual,
-        "inheritance_age": inheritance_age,
-        "inherited_rent_monthly": inherited_rent_monthly,
-    }
-    diagnostic_summary = build_diagnostic_summary(
-        scenario_name, global_settings, current_norm, recommended_norm, custom_norm, current_metrics, cur_sum, rec_sum, cus_sum, validation_df
-    )
-    mc_path_log = build_mc_path_log(
-        scenario_row.to_dict(), df_to_records(current_norm), df_to_records(recommended_norm),
-        simulation_years, start_assets_twd, CURRENT_AGE, CURRENT_YEAR, salary_annual, salary_growth_pct,
-        retirement_age, tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, biz_projection_list,
-        tuotuozu_fallback_mode, living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual,
-        mortgage_annual, inheritance_age, inherited_rent_monthly, withdrawal_strategy, rebalance_frequency_years,
-        mode_override_value, monte_carlo_sims, 42
-    )
-    full_log = build_full_log(
-        global_settings, current_norm, recommended_norm, custom_norm, scenario_row.to_dict(),
-        cur_res, rec_res, cus_res, validation_df, diagnostic_summary, mc_path_log
-    )
-
-    if audit_choice == "Current":
-        st.dataframe(format_table_df(current_norm, pct_cols=["hist_10y_cagr_pct","model_return_pct","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct"], keep_cols=audit_keep), use_container_width=True, hide_index=True)
-    elif audit_choice == "Recommended":
-        st.dataframe(format_table_df(recommended_norm, pct_cols=["hist_10y_cagr_pct","model_return_pct","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct"], keep_cols=audit_keep), use_container_width=True, hide_index=True)
-    elif audit_choice == "Custom":
-        st.dataframe(format_table_df(custom_norm, pct_cols=["hist_10y_cagr_pct","model_return_pct","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct"], keep_cols=audit_keep), use_container_width=True, hide_index=True)
-    else:
-        d1, d2 = st.columns(2)
-        d1.download_button("下載完整 LOG（JSON）", json.dumps(full_log, ensure_ascii=False, indent=2), "simulation_full_log.json", "application/json")
-        d2.download_button("下載診斷摘要（txt）", diagnostic_summary, "diagnostic_summary.txt", "text/plain")
-        st.text_area("可直接複製的診斷摘要", diagnostic_summary, height=380)
-        st.caption("若沒有真實 10Y / 5Y / 3Y 價格資料，系統會清楚標示 unavailable / bucket default，不假裝精準。")
-
+        if audit_choice == "Current":
+            st.dataframe(format_table_df(current_norm, pct_cols=["hist_10y_cagr_pct","model_return_pct","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct"], keep_cols=audit_keep), use_container_width=True, hide_index=True)
+        elif audit_choice == "Recommended":
+            st.dataframe(format_table_df(recommended_norm, pct_cols=["hist_10y_cagr_pct","model_return_pct","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct"], keep_cols=audit_keep), use_container_width=True, hide_index=True)
+        elif audit_choice == "Custom":
+            st.dataframe(format_table_df(custom_norm, pct_cols=["hist_10y_cagr_pct","model_return_pct","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct"], keep_cols=audit_keep), use_container_width=True, hide_index=True)
+        else:
+            d1, d2 = st.columns(2)
+            d1.download_button("下載輕量 LOG（JSON）", json.dumps(light_log, ensure_ascii=False, indent=2), "simulation_light_log.json", "application/json")
+            d2.download_button("下載診斷摘要（txt）", diagnostic_summary, "diagnostic_summary.txt", "text/plain")
+            st.text_area("可直接複製的診斷摘要", diagnostic_summary, height=380)
+            st.caption("預設先提供輕量 LOG，避免一進頁就跑重型 replay。需要完整路徑再手動產生。")
+            if st.button("產生完整 LOG（較慢，含 Monte Carlo path replay）", key="gen_full_log_btn"):
+                with st.spinner("正在產生完整 LOG，這一步會比較慢..."):
+                    mc_path_log = build_mc_path_log(
+                        scenario_row.to_dict(), df_to_records(current_norm), df_to_records(recommended_norm),
+                        simulation_years, start_assets_twd, CURRENT_AGE, CURRENT_YEAR, salary_annual, salary_growth_pct,
+                        retirement_age, tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, biz_projection_list,
+                        tuotuozu_fallback_mode, living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual,
+                        mortgage_annual, inheritance_age, inherited_rent_monthly, withdrawal_strategy, rebalance_frequency_years,
+                        mode_override_value, monte_carlo_sims, 42
+                    )
+                    full_log = build_full_log(
+                        global_settings, current_norm, recommended_norm, custom_norm, scenario_row.to_dict(),
+                        cur_res, rec_res, cus_res, validation_df, diagnostic_summary, mc_path_log
+                    )
+                    full_log = sanitize_for_json(full_log)
+                    st.download_button("下載完整 LOG（JSON）", json.dumps(full_log, ensure_ascii=False, indent=2), "simulation_full_log.json", "application/json", key="download_full_log_btn")
+                    st.success(f"完整 LOG 已產生，含 {len(mc_path_log)} 筆 path records。")
+            st.caption("若沒有真實 10Y / 5Y / 3Y 價格資料，系統會清楚標示 unavailable / bucket default，不假裝精準。")
+    except Exception as e:
+        st.error(f"假設透明化 / LOG 頁產生失敗：{e}")
 with main_tabs[5]:
-    st.markdown("## 驗證 / 除錯")
-    if 'validation_df' not in locals() or validation_df.empty:
-        validation_df = pd.DataFrame([{"檢查項目": "最小檢查集", "結果": "INFO", "說明": "尚未產生完整模擬結果，但權重與缺值檢查已完成。"}])
+    try:
+        st.markdown("## 驗證 / 除錯")
+        if validation_df.empty:
+            validation_df = pd.DataFrame([{"檢查項目": "最小檢查集", "結果": "INFO", "說明": "尚未產生完整模擬結果，但權重與缺值檢查已完成。"}])
 
-    st.info("這一頁是模型的體檢表。若這裡有 FAIL 或 WARNING，就不要急著相信最終資產數字。")
-    v1, v2, v3, v4 = st.columns(4)
-    v1.metric("PASS 數", int((validation_df["結果"] == "PASS").sum()))
-    v2.metric("WARNING 數", int((validation_df["結果"] == "WARNING").sum()))
-    v3.metric("FAIL 數", int((validation_df["結果"] == "FAIL").sum()))
-    v4.metric("INFO 數", int((validation_df["結果"] == "INFO").sum()))
+        st.info("這一頁是模型的體檢表。若這裡有 FAIL 或 WARNING，就不要急著相信最終資產數字。")
+        v1, v2, v3, v4 = st.columns(4)
+        v1.metric("PASS 數", int((validation_df["結果"] == "PASS").sum()))
+        v2.metric("WARNING 數", int((validation_df["結果"] == "WARNING").sum()))
+        v3.metric("FAIL 數", int((validation_df["結果"] == "FAIL").sum()))
+        v4.metric("INFO 數", int((validation_df["結果"] == "INFO").sum()))
 
-    fail_df = validation_df.loc[validation_df["結果"] == "FAIL"]
-    warn_df = validation_df.loc[validation_df["結果"] == "WARNING"]
-    if not fail_df.empty:
-        st.error("目前有 FAIL 項目，建議先修模型再解讀結果。")
-    elif not warn_df.empty:
-        st.warning("目前有 WARNING 項目，代表這版模型還有需要人工判讀的地方。")
-    else:
-        st.success("目前最小檢查集皆通過。")
+        fail_df = validation_df.loc[validation_df["結果"] == "FAIL"]
+        warn_df = validation_df.loc[validation_df["結果"] == "WARNING"]
+        if not fail_df.empty:
+            st.error("目前有 FAIL 項目，建議先修模型再解讀結果。")
+        elif not warn_df.empty:
+            st.warning("目前有 WARNING 項目，代表這版模型還有需要人工判讀的地方。")
+        else:
+            st.success("目前最小檢查集皆通過。")
 
-    st.dataframe(validation_df, use_container_width=True, hide_index=True)
+        st.dataframe(validation_df, use_container_width=True, hide_index=True)
 
-    sens_rows = []
-    for param, low, high, label in [
-        ("cash_reserve_target_pct", max(0,cash_reserve_target_pct-4), min(40,cash_reserve_target_pct+4), "現金保留比重"),
-        ("salary_growth_pct", max(-5,salary_growth_pct-1), min(20,salary_growth_pct+1), "薪資成長率"),
-        ("tuotuozu_decay_pct", max(-50,tuotuozu_decay_pct-3), min(30,tuotuozu_decay_pct+3), "妥妥租衰退率"),
-        ("inflation_pct", max(0,inflation_pct-1), min(20,inflation_pct+1), "通膨率"),
-        ("edu_phase2_annual", max(0,edu_phase2_annual-200000), edu_phase2_annual+200000, "教育費高峰"),
-    ]:
-        sens_rows.append({"參數": label, "低值": low, "高值": high, "提醒": "這項對結果常有明顯影響，調整前後請重跑並比較圖表。"})
-    st.markdown("### 最敏感 5 個參數（人工提醒版）")
-    st.dataframe(format_table_df(pd.DataFrame(sens_rows), human_cols=["低值","高值"]), use_container_width=True, hide_index=True)
-
+        sens_rows = []
+        for param, low, high, label in [
+            ("cash_reserve_target_pct", max(0,cash_reserve_target_pct-4), min(40,cash_reserve_target_pct+4), "現金保留比重"),
+            ("salary_growth_pct", max(-5,salary_growth_pct-1), min(20,salary_growth_pct+1), "薪資成長率"),
+            ("tuotuozu_decay_pct", max(-50,tuotuozu_decay_pct-3), min(30,tuotuozu_decay_pct+3), "妥妥租衰退率"),
+            ("inflation_pct", max(0,inflation_pct-1), min(20,inflation_pct+1), "通膨率"),
+            ("edu_phase2_annual", max(0,edu_phase2_annual-200000), edu_phase2_annual+200000, "教育費高峰"),
+        ]:
+            sens_rows.append({"參數": label, "低值": low, "高值": high, "提醒": "這項對結果常有明顯影響，調整前後請重跑並比較圖表。"})
+        st.markdown("### 最敏感 5 個參數（人工提醒版）")
+        st.dataframe(format_table_df(pd.DataFrame(sens_rows), human_cols=["低值","高值"]), use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.error(f"驗證 / 除錯頁產生失敗：{e}")
 with main_tabs[6]:
 
     st.markdown("## 原始資料與下載")
