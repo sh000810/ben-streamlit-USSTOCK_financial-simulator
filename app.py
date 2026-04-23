@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
@@ -617,6 +618,26 @@ def cached_load_biz_projection(source):
     return load_business_income_projection(source)
 
 
+def openpyxl_available() -> bool:
+    return importlib.util.find_spec("openpyxl") is not None
+
+
+def get_biz_excel_diagnostics(mode: str, source_mode: str | None, uploaded_file, built_in_path: Path, projection_list: list[float], projection_preview: pd.DataFrame) -> list[str]:
+    notes: list[str] = []
+    if mode != "Excel 預測":
+        return notes
+    if source_mode == "使用內建範例 Excel":
+        notes.append(f"內建 Excel 路徑：{built_in_path}")
+        notes.append(f"內建 Excel 是否存在：{'是' if built_in_path.exists() else '否'}")
+    elif source_mode == "上傳 Excel":
+        notes.append(f"是否已上傳 Excel：{'是' if uploaded_file is not None else '否'}")
+    notes.append(f"openpyxl 是否可用：{'是' if openpyxl_available() else '否'}")
+    notes.append(f"目前成功讀到的年度筆數：{len(projection_list)}")
+    if projection_preview.empty:
+        notes.append("預覽表目前為空。")
+    return notes
+
+
 saved = load_json(SETTINGS_PATH)
 
 with st.sidebar:
@@ -646,6 +667,7 @@ with st.sidebar:
     withdrawal_strategy = st.selectbox("現金不足時提領方式", ["比例賣出", "先賣現金 / ETF", "先賣波動低資產"], index=["比例賣出", "先賣現金 / ETF", "先賣波動低資產"].index(saved.get("withdrawal_strategy", "比例賣出")), help="生活費不夠時，系統要先賣哪一種資產。")
     cash_reserve_target_pct = st.slider("現金保留比重 %", 0.0, 40.0, float(saved.get("cash_reserve_target_pct", defaults["cash_reserve_target_pct"])), step=0.5, help="越高越穩，但成長性通常會下降。")
     monte_carlo_sims = st.slider("Monte Carlo 次數", 100, 1500, int(saved.get("monte_carlo_sims", defaults.get("monte_carlo_sims", 500))), step=100, help="次數越高，勝率更穩定，但會比較慢。")
+    enable_heavy_compute = st.toggle("預載重型分析（情境矩陣 / Monte Carlo）", value=bool(saved.get("enable_heavy_compute", False)), help="關掉時，5/6 頁與一般操作會快很多。需要看情境矩陣或 Monte Carlo 時再打開。")
 
     st.header("3) 本業收入（加薪→退休）")
     salary_annual = sidebar_number_input("本業年薪", min_value=0.0, value=float(saved.get("salary_annual", defaults["salary_annual"])), step=50000.0, digits=1, help="你可支配的本業年度收入，不是公司營收。")
@@ -655,13 +677,29 @@ with st.sidebar:
     st.header("4) 妥妥租收入（遞減 / Excel）")
     tuotuozu_mode = st.radio("妥妥租模式", ["手動遞減", "Excel 預測"], index=0 if saved.get("tuotuozu_mode", "手動遞減") == "手動遞減" else 1, help="手動遞減適合快速試算；Excel 預測適合沿用你原本的預測表。")
     biz_projection_list, biz_projection_preview = [], pd.DataFrame(columns=["year", "net_profit_twd"])
+    biz_excel_source_mode = saved.get("biz_excel_source_mode", "使用內建範例 Excel")
+    uploaded_biz_excel = None
+    biz_excel_error_message = ""
     if tuotuozu_mode == "Excel 預測":
         biz_excel_source_mode = st.radio("妥妥租 Excel", ["使用內建範例 Excel", "上傳 Excel"], index=0 if saved.get("biz_excel_source_mode", "使用內建範例 Excel") == "使用內建範例 Excel" else 1, help="如果你 repo 的 data 裡有妥妥租_預測.xlsx，可直接用內建版本。")
         uploaded_biz_excel = st.file_uploader("上傳 妥妥租_預測.xlsx", type=["xlsx"], key="uploaded_biz_excel")
-        if biz_excel_source_mode == "上傳 Excel" and uploaded_biz_excel is not None:
-            biz_projection_list, biz_projection_preview = cached_load_biz_projection(uploaded_biz_excel)
-        elif SAMPLE_BIZ_XLSX.exists():
-            biz_projection_list, biz_projection_preview = cached_load_biz_projection(str(SAMPLE_BIZ_XLSX))
+        if not openpyxl_available():
+            biz_excel_error_message = "目前環境缺少 openpyxl，pandas 無法讀取 .xlsx。請把 openpyxl 加進 requirements.txt 後重新部署。"
+        elif biz_excel_source_mode == "上傳 Excel":
+            if uploaded_biz_excel is not None:
+                biz_projection_list, biz_projection_preview = cached_load_biz_projection(uploaded_biz_excel)
+                if len(biz_projection_list) == 0:
+                    biz_excel_error_message = "已上傳 Excel，但沒有成功解析出年度淨利資料。請檢查工作表名稱與欄位。"
+            else:
+                biz_excel_error_message = "目前選擇『上傳 Excel』，但尚未上傳檔案。"
+        else:
+            if SAMPLE_BIZ_XLSX.exists():
+                biz_projection_list, biz_projection_preview = cached_load_biz_projection(str(SAMPLE_BIZ_XLSX))
+                if len(biz_projection_list) == 0:
+                    biz_excel_error_message = f"找到內建 Excel，但沒有成功解析內容：{SAMPLE_BIZ_XLSX}"
+            else:
+                biz_excel_error_message = f"找不到內建 Excel 檔案：{SAMPLE_BIZ_XLSX}"
+    biz_excel_diagnostics = get_biz_excel_diagnostics(tuotuozu_mode, biz_excel_source_mode, uploaded_biz_excel, SAMPLE_BIZ_XLSX, biz_projection_list, biz_projection_preview)
     tuotuozu_base_annual = sidebar_number_input("妥妥租目前年度淨利", min_value=0.0, value=float(saved.get("tuotuozu_base_annual", defaults["tuotuozu_base_annual"])), step=100000.0, digits=1, help="當你不用 Excel 時，這個數字就是妥妥租收入的起點。")
     tuotuozu_decay_pct = sidebar_number_input("妥妥租年衰退率 %", min_value=-50.0, max_value=30.0, value=float(saved.get("tuotuozu_decay_pct", defaults["tuotuozu_decay_pct"])), step=0.5, digits=1, help="例如 10 代表每年衰退 10%。")
     tuotuozu_fallback_mode = st.selectbox("Excel 年數用完後", ["continue_decay_from_last_value", "zero_after_list_end"], index=0 if saved.get("tuotuozu_fallback_mode", "continue_decay_from_last_value") == "continue_decay_from_last_value" else 1, format_func=lambda x: "從最後一年繼續遞減" if x == "continue_decay_from_last_value" else "直接歸零", help="若 Excel 只有 10 年、你模擬 20 年，後面要怎麼處理。")
@@ -823,9 +861,13 @@ with main_tabs[0]:
         if tuotuozu_mode != "Excel 預測":
             st.warning("目前為「手動遞減」模式，尚未啟用 Excel 預測，因此此處不顯示 Excel 預覽。")
         elif biz_projection_preview.empty:
-            st.error("已切換到 Excel 預測模式，但目前沒有成功讀到 Excel 資料。請檢查檔名、上傳檔案與欄位格式。")
+            st.error(biz_excel_error_message or "已切換到 Excel 預測模式，但目前沒有成功讀到 Excel 資料。")
+            if biz_excel_diagnostics:
+                st.caption(" / ".join(biz_excel_diagnostics))
         else:
             st.success(f"已成功讀取 {len(biz_projection_preview)} 年妥妥租預測資料。")
+            if biz_excel_diagnostics:
+                st.caption(" / ".join(biz_excel_diagnostics))
             st.dataframe(format_table_df(biz_projection_preview, human_cols=["net_profit_twd"]), use_container_width=True, hide_index=True)
 
     save_col1, save_col2, save_col3 = st.columns([1,1,2])
@@ -839,6 +881,7 @@ with main_tabs[0]:
             "withdrawal_strategy": withdrawal_strategy,
             "cash_reserve_target_pct": cash_reserve_target_pct,
             "monte_carlo_sims": monte_carlo_sims,
+            "enable_heavy_compute": enable_heavy_compute,
             "salary_annual": salary_annual,
             "salary_growth_pct": salary_growth_pct,
             "retirement_age": retirement_age,
@@ -1037,37 +1080,41 @@ with main_tabs[2]:
 
 with main_tabs[3]:
     st.markdown("## 情境矩陣 / Monte Carlo")
-    matrix_rows = []
-    for _, srow in pd.DataFrame(scenario_df).iterrows():
-        cur = simulate_portfolio(current_norm, srow, simulation_years, start_assets_twd, CURRENT_AGE, CURRENT_YEAR, salary_annual, salary_growth_pct, retirement_age, tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, biz_projection_list, tuotuozu_fallback_mode, living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual, mortgage_annual, inheritance_age, inherited_rent_monthly, withdrawal_strategy, rebalance_frequency_years, None, seed=42)
-        rec = simulate_portfolio(recommended_norm, srow, simulation_years, start_assets_twd, CURRENT_AGE, CURRENT_YEAR, salary_annual, salary_growth_pct, retirement_age, tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, biz_projection_list, tuotuozu_fallback_mode, living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual, mortgage_annual, inheritance_age, inherited_rent_monthly, withdrawal_strategy, rebalance_frequency_years, None, seed=43)
-        cur_s = summarize_simulation(cur, start_assets_twd)
-        rec_s = summarize_simulation(rec, start_assets_twd)
-        matrix_rows.append({
-            "情境": srow["scenario_name"],
-            "Current 最終資產": cur_s.get("最終資產終值"),
-            "Recommended 最終資產": rec_s.get("最終資產終值"),
-            "Current 最大回撤%": cur_s.get("最大回撤 %"),
-            "Recommended 最大回撤%": rec_s.get("最大回撤 %"),
-            "Current 人生適配分數": cur_s.get("人生適配分數"),
-            "Recommended 人生適配分數": rec_s.get("人生適配分數"),
-        })
-    matrix_df = pd.DataFrame(matrix_rows)
-    st.dataframe(format_table_df(matrix_df, pct_cols=["Current 最大回撤%","Recommended 最大回撤%"], human_cols=["Current 最終資產","Recommended 最終資產"]), use_container_width=True, hide_index=True)
+    if not enable_heavy_compute:
+        st.info("目前已關閉『預載重型分析』，所以這一頁不會自動跑情境矩陣與 Monte Carlo。這樣可以大幅加快 5/6 頁與整體操作速度。")
+        st.caption("需要重型分析時，請到左側打開『預載重型分析（情境矩陣 / Monte Carlo）』後再重新整理。")
+    else:
+        matrix_rows = []
+        for _, srow in pd.DataFrame(scenario_df).iterrows():
+            cur = simulate_portfolio(current_norm, srow, simulation_years, start_assets_twd, CURRENT_AGE, CURRENT_YEAR, salary_annual, salary_growth_pct, retirement_age, tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, biz_projection_list, tuotuozu_fallback_mode, living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual, mortgage_annual, inheritance_age, inherited_rent_monthly, withdrawal_strategy, rebalance_frequency_years, None, seed=42)
+            rec = simulate_portfolio(recommended_norm, srow, simulation_years, start_assets_twd, CURRENT_AGE, CURRENT_YEAR, salary_annual, salary_growth_pct, retirement_age, tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, biz_projection_list, tuotuozu_fallback_mode, living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual, mortgage_annual, inheritance_age, inherited_rent_monthly, withdrawal_strategy, rebalance_frequency_years, None, seed=43)
+            cur_s = summarize_simulation(cur, start_assets_twd)
+            rec_s = summarize_simulation(rec, start_assets_twd)
+            matrix_rows.append({
+                "情境": srow["scenario_name"],
+                "Current 最終資產": cur_s.get("最終資產終值"),
+                "Recommended 最終資產": rec_s.get("最終資產終值"),
+                "Current 最大回撤%": cur_s.get("最大回撤 %"),
+                "Recommended 最大回撤%": rec_s.get("最大回撤 %"),
+                "Current 人生適配分數": cur_s.get("人生適配分數"),
+                "Recommended 人生適配分數": rec_s.get("人生適配分數"),
+            })
+        matrix_df = pd.DataFrame(matrix_rows)
+        st.dataframe(format_table_df(matrix_df, pct_cols=["Current 最大回撤%","Recommended 最大回撤%"], human_cols=["Current 最終資產","Recommended 最終資產"]), use_container_width=True, hide_index=True)
 
-    sims_df, mc_metrics = run_monte_carlo_compare(
-        current_norm, recommended_norm, scenario_row, simulation_years, start_assets_twd, CURRENT_AGE, CURRENT_YEAR,
-        salary_annual, salary_growth_pct, retirement_age, tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, biz_projection_list, tuotuozu_fallback_mode,
-        living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual, mortgage_annual, inheritance_age, inherited_rent_monthly,
-        withdrawal_strategy, rebalance_frequency_years, mode_override_value, simulations=monte_carlo_sims, seed=42
-    )
-    m1,m2,m3,m4 = st.columns(4)
-    m1.metric("Recommended 勝過 Current 機率", fmt_pct(mc_metrics.get("B 方案勝過 A 方案的機率"),1))
-    m2.metric("Current 資產耗盡機率", fmt_pct(mc_metrics.get("Current 資產耗盡機率"),1))
-    m3.metric("Recommended 資產耗盡機率", fmt_pct(mc_metrics.get("Recommended 資產耗盡機率"),1))
-    m4.metric("Recommended 中位數終值", fmt_human(mc_metrics.get("Recommended 終值中位數"),1))
-    long_mc = sims_df.melt(value_vars=["current_final_assets_twd","recommended_final_assets_twd"], var_name="portfolio", value_name="final_assets_twd")
-    st.plotly_chart(px.histogram(long_mc, x="final_assets_twd", color="portfolio", barmode="overlay", nbins=40, title="Monte Carlo 終值分布"), use_container_width=True)
+        sims_df, mc_metrics = run_monte_carlo_compare(
+            current_norm, recommended_norm, scenario_row, simulation_years, start_assets_twd, CURRENT_AGE, CURRENT_YEAR,
+            salary_annual, salary_growth_pct, retirement_age, tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, biz_projection_list, tuotuozu_fallback_mode,
+            living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual, mortgage_annual, inheritance_age, inherited_rent_monthly,
+            withdrawal_strategy, rebalance_frequency_years, mode_override_value, simulations=monte_carlo_sims, seed=42
+        )
+        m1,m2,m3,m4 = st.columns(4)
+        m1.metric("Recommended 勝過 Current 機率", fmt_pct(mc_metrics.get("B 方案勝過 A 方案的機率"),1))
+        m2.metric("Current 資產耗盡機率", fmt_pct(mc_metrics.get("Current 資產耗盡機率"),1))
+        m3.metric("Recommended 資產耗盡機率", fmt_pct(mc_metrics.get("Recommended 資產耗盡機率"),1))
+        m4.metric("Recommended 中位數終值", fmt_human(mc_metrics.get("Recommended 終值中位數"),1))
+        long_mc = sims_df.melt(value_vars=["current_final_assets_twd","recommended_final_assets_twd"], var_name="portfolio", value_name="final_assets_twd")
+        st.plotly_chart(px.histogram(long_mc, x="final_assets_twd", color="portfolio", barmode="overlay", nbins=40, title="Monte Carlo 終值分布"), use_container_width=True)
 
 with main_tabs[4]:
     try:
