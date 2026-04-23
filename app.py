@@ -38,8 +38,8 @@ SAMPLE_BIZ_XLSX = DATA_DIR / "妥妥租_預測.xlsx"
 SETTINGS_PATH = DATA_DIR / "user_saved_settings.json"
 
 st.set_page_config(page_title="Ben 財務與投資模擬器", layout="wide")
-st.title("Ben 財務與投資模擬器 · 透明化驗算版 v7")
-st.caption("加入：數字格式統一、Assumption Audit、完整 LOG / 診斷摘要、驗證 tab 補齊、模型假設透明化。")
+st.title("Ben 財務與投資模擬器 · 透明化驗算版 v7.1")
+st.caption("加入：數字格式統一、側邊欄可讀值提示、Assumption Audit、完整 LOG / 診斷摘要、驗證 tab 補齊、模型假設透明化。")
 
 st.markdown("""
 <style>
@@ -107,9 +107,27 @@ def fmt_human(x: Any, digits: int = 1) -> str:
             return f"{x/1_000_000:.{digits}f}M"
         if abs_x >= 1_000:
             return f"{x/1_000:.{digits}f}K"
-        return f"{x:,.0f}"
+        return f"{x:,.{digits}f}" if digits > 0 else f"{x:,.0f}"
     except Exception:
         return "—"
+
+
+def sidebar_number_input(label: str, *, value: float, min_value: float = 0.0, max_value: float | None = None, step: float = 1.0, digits: int = 1, help: str | None = None, key: str | None = None) -> float:
+    kwargs = {
+        "label": label,
+        "min_value": min_value,
+        "value": float(value),
+        "step": step,
+        "format": f"%.{digits}f",
+        "help": help,
+    }
+    if max_value is not None:
+        kwargs["max_value"] = max_value
+    if key is not None:
+        kwargs["key"] = key
+    result = st.number_input(**kwargs)
+    st.caption(f"目前值：{fmt_num(result, digits)}")
+    return float(result)
 
 
 SUPER_WINNER_AI = {"NVDA", "AMD", "ANET", "AVGO", "ASML", "MRVL", "MU"}
@@ -298,7 +316,10 @@ def build_validation_checks(current_df: pd.DataFrame, recommended_df: pd.DataFra
     different_weights = abs(float(recommended_df.loc[recommended_df["include"], "weight_pct"].sum()) - float(custom_df.loc[custom_df["include"], "weight_pct"].sum())) >= 0 # placeholder
     same_results = False
     if cus_res is not None and not cus_res.empty:
-        same_results = rec_res["end_assets_twd"].round(6).equals(cus_res["end_assets_twd"].round(6)) and not recommended_df["weight_pct"].round(4).equals(custom_df["weight_pct"].round(4))
+        rec_weights = recommended_df.loc[recommended_df["include"], ["ticker", "weight_pct"]].sort_values("ticker").reset_index(drop=True)
+        cus_weights = custom_df.loc[custom_df["include"], ["ticker", "weight_pct"]].sort_values("ticker").reset_index(drop=True)
+        weights_are_different = not rec_weights.equals(cus_weights)
+        same_results = rec_res["end_assets_twd"].round(6).equals(cus_res["end_assets_twd"].round(6)) and weights_are_different
     checks.append({"檢查項目": "Custom / Recommended 不應不同配置卻完全相同", "結果": "FAIL" if same_results else "PASS", "說明": f"情境：{scenario_name}"})
     ruin_missing = bool((rec_res["end_assets_twd"] < 0).any() and not (rec_res["ruin_flag"] == 1).any())
     checks.append({"檢查項目": "負資產耗盡邏輯", "結果": "FAIL" if ruin_missing else "PASS", "說明": "若資產為負，應標示耗盡年份。"})
@@ -515,7 +536,7 @@ with st.sidebar:
         key="source_mode",
     )
     uploaded_csv = st.file_uploader("上傳持股 CSV", type=["csv"], key="uploaded_csv")
-    fx_rate = st.number_input("USD/TWD 匯率", min_value=20.0, max_value=50.0, value=float(saved.get("fx_rate", 32.0)), step=0.1, help="把美元持股換算成台幣時使用。")
+    fx_rate = sidebar_number_input("USD/TWD 匯率", min_value=20.0, max_value=50.0, value=float(saved.get("fx_rate", 32.0)), step=0.1, digits=1, help="把美元持股換算成台幣時使用。")
 
     csv_source = SAMPLE_CSV if SAMPLE_CSV.exists() else uploaded_csv
     if source_mode == "上傳新的 CSV" and uploaded_csv is not None:
@@ -526,7 +547,7 @@ with st.sidebar:
     defaults = default_control_values(uploaded_total_usd, fx_rate)
 
     st.header("2) 模型控制")
-    start_assets_twd = st.number_input("起始流動資產 (TWD)", min_value=0.0, value=float(saved.get("start_assets_twd", defaults["start_assets_twd"])), step=100000.0, help="三組方案比較時共用的起跑點。越一致，結果越能比較。")
+    start_assets_twd = sidebar_number_input("起始流動資產 (TWD)", min_value=0.0, value=float(saved.get("start_assets_twd", defaults["start_assets_twd"])), step=100000.0, digits=1, help="三組方案比較時共用的起跑點。越一致，結果越能比較。")
     simulation_years = st.slider("模擬年數", 5, 30, int(saved.get("simulation_years", defaults["simulation_years"])), help="通常先看 20 年，才能看到退休與教育費高峰。")
     rebalance_frequency_years = st.selectbox("再平衡頻率", options=[0, 1, 2, 3, 5], index=[0,1,2,3,5].index(int(saved.get("rebalance_frequency_years", defaults["rebalance_frequency_years"]))), format_func=lambda x: "不再平衡" if x == 0 else f"每 {x} 年", help="多久把持股比例拉回目標權重。新手建議每 1 年。")
     withdrawal_strategy = st.selectbox("現金不足時提領方式", ["比例賣出", "先賣現金 / ETF", "先賣波動低資產"], index=["比例賣出", "先賣現金 / ETF", "先賣波動低資產"].index(saved.get("withdrawal_strategy", "比例賣出")), help="生活費不夠時，系統要先賣哪一種資產。")
@@ -534,8 +555,8 @@ with st.sidebar:
     monte_carlo_sims = st.slider("Monte Carlo 次數", 100, 1500, int(saved.get("monte_carlo_sims", defaults.get("monte_carlo_sims", 500))), step=100, help="次數越高，勝率更穩定，但會比較慢。")
 
     st.header("3) 本業收入（加薪→退休）")
-    salary_annual = st.number_input("本業年薪", min_value=0.0, value=float(saved.get("salary_annual", defaults["salary_annual"])), step=50000.0, help="你可支配的本業年度收入，不是公司營收。")
-    salary_growth_pct = st.number_input("薪資成長率 %", min_value=-5.0, max_value=20.0, value=float(saved.get("salary_growth_pct", defaults["salary_growth_pct"])), step=0.1, help="退休前本業收入每年成長率。新手可先用 2%。")
+    salary_annual = sidebar_number_input("本業年薪", min_value=0.0, value=float(saved.get("salary_annual", defaults["salary_annual"])), step=50000.0, digits=1, help="你可支配的本業年度收入，不是公司營收。")
+    salary_growth_pct = sidebar_number_input("薪資成長率 %", min_value=-5.0, max_value=20.0, value=float(saved.get("salary_growth_pct", defaults["salary_growth_pct"])), step=0.1, digits=1, help="退休前本業收入每年成長率。新手可先用 2%。")
     retirement_age = st.number_input("退休年齡", min_value=45, max_value=90, value=int(saved.get("retirement_age", defaults["retirement_age"])), step=1, help="到了這個年齡，本業收入會歸零。")
 
     st.header("4) 妥妥租收入（遞減 / Excel）")
@@ -548,18 +569,18 @@ with st.sidebar:
             biz_projection_list, biz_projection_preview = cached_load_biz_projection(uploaded_biz_excel)
         elif SAMPLE_BIZ_XLSX.exists():
             biz_projection_list, biz_projection_preview = cached_load_biz_projection(str(SAMPLE_BIZ_XLSX))
-    tuotuozu_base_annual = st.number_input("妥妥租目前年度淨利", min_value=0.0, value=float(saved.get("tuotuozu_base_annual", defaults["tuotuozu_base_annual"])), step=100000.0, help="當你不用 Excel 時，這個數字就是妥妥租收入的起點。")
-    tuotuozu_decay_pct = st.number_input("妥妥租年衰退率 %", min_value=-50.0, max_value=30.0, value=float(saved.get("tuotuozu_decay_pct", defaults["tuotuozu_decay_pct"])), step=0.5, help="例如 10 代表每年衰退 10%。")
+    tuotuozu_base_annual = sidebar_number_input("妥妥租目前年度淨利", min_value=0.0, value=float(saved.get("tuotuozu_base_annual", defaults["tuotuozu_base_annual"])), step=100000.0, digits=1, help="當你不用 Excel 時，這個數字就是妥妥租收入的起點。")
+    tuotuozu_decay_pct = sidebar_number_input("妥妥租年衰退率 %", min_value=-50.0, max_value=30.0, value=float(saved.get("tuotuozu_decay_pct", defaults["tuotuozu_decay_pct"])), step=0.5, digits=1, help="例如 10 代表每年衰退 10%。")
     tuotuozu_fallback_mode = st.selectbox("Excel 年數用完後", ["continue_decay_from_last_value", "zero_after_list_end"], index=0 if saved.get("tuotuozu_fallback_mode", "continue_decay_from_last_value") == "continue_decay_from_last_value" else 1, format_func=lambda x: "從最後一年繼續遞減" if x == "continue_decay_from_last_value" else "直接歸零", help="若 Excel 只有 10 年、你模擬 20 年，後面要怎麼處理。")
 
     st.header("5) 支出 / 繼承")
-    living_expense_annual = st.number_input("基礎生活費 / 年", min_value=0.0, value=float(saved.get("living_expense_annual", defaults["living_expense_annual"])), step=50000.0, help="不含教育費的家庭年度生活支出。")
-    inflation_pct = st.number_input("通膨率 %", min_value=0.0, max_value=20.0, value=float(saved.get("inflation_pct", defaults["inflation_pct"])), step=0.1, help="生活費逐年上升的速度。")
-    edu_phase1_annual = st.number_input("教育費 2026-2033 / 年", min_value=0.0, value=float(saved.get("edu_phase1_annual", defaults["edu_phase1_annual"])), step=50000.0, help="教育費中度區間。")
-    edu_phase2_annual = st.number_input("教育費 2034-2038 / 年", min_value=0.0, value=float(saved.get("edu_phase2_annual", defaults["edu_phase2_annual"])), step=50000.0, help="教育費高峰區間。")
-    mortgage_annual = st.number_input("房貸 / 居住成本 / 年", min_value=0.0, value=float(saved.get("mortgage_annual", defaults["mortgage_annual"])), step=50000.0, help="如果已經含在生活費，這裡就不要再重複算。")
+    living_expense_annual = sidebar_number_input("基礎生活費 / 年", min_value=0.0, value=float(saved.get("living_expense_annual", defaults["living_expense_annual"])), step=50000.0, digits=1, help="不含教育費的家庭年度生活支出。")
+    inflation_pct = sidebar_number_input("通膨率 %", min_value=0.0, max_value=20.0, value=float(saved.get("inflation_pct", defaults["inflation_pct"])), step=0.1, digits=1, help="生活費逐年上升的速度。")
+    edu_phase1_annual = sidebar_number_input("教育費 2026-2033 / 年", min_value=0.0, value=float(saved.get("edu_phase1_annual", defaults["edu_phase1_annual"])), step=50000.0, digits=1, help="教育費中度區間。")
+    edu_phase2_annual = sidebar_number_input("教育費 2034-2038 / 年", min_value=0.0, value=float(saved.get("edu_phase2_annual", defaults["edu_phase2_annual"])), step=50000.0, digits=1, help="教育費高峰區間。")
+    mortgage_annual = sidebar_number_input("房貸 / 居住成本 / 年", min_value=0.0, value=float(saved.get("mortgage_annual", defaults["mortgage_annual"])), step=50000.0, digits=1, help="如果已經含在生活費，這裡就不要再重複算。")
     inheritance_age = st.number_input("遺產事件年齡", min_value=45, max_value=90, value=int(saved.get("inheritance_age", defaults["inheritance_age"])), step=1, help="從這個年齡開始，繼承租金收入會進來。")
-    inherited_rent_monthly = st.number_input("遺產後租金 / 月", min_value=0.0, value=float(saved.get("inherited_rent_monthly", defaults["inherited_rent_monthly"])), step=5000.0, help="遺產事件發生後，每月新增多少租金收入。")
+    inherited_rent_monthly = sidebar_number_input("遺產後租金 / 月", min_value=0.0, value=float(saved.get("inherited_rent_monthly", defaults["inherited_rent_monthly"])), step=5000.0, digits=1, help="遺產事件發生後，每月新增多少租金收入。")
 
     st.header("6) 設定儲存")
     st.caption("此版本會把設定存成 JSON。Cloud 重啟或重新部署後可能需要重新載入，但一般重新整理不會全失。")
@@ -823,6 +844,17 @@ with main_tabs[2]:
     s3.metric("Custom 最終資產", fmt_human(cus_sum.get("最終資產終值"), 1))
     s4.metric("Recommended 最大回撤", fmt_pct(rec_sum.get("最大回撤 %"), 1))
 
+    scenario_alerts = []
+    if not rec_res.empty and rec_res["portfolio_return_pct"].abs().max() > 0 and abs(float(rec_sum.get("最大回撤 %", 0) or 0)) < 1e-9:
+        scenario_alerts.append("Recommended 最大回撤顯示為 0.0%，但年度報酬有波動，這通常代表 drawdown 邏輯或顯示需要再驗。")
+    if not cus_res.empty:
+        rec_weights = recommended_norm.loc[recommended_norm["include"], ["ticker", "weight_pct"]].sort_values("ticker").reset_index(drop=True)
+        cus_weights = custom_norm.loc[custom_norm["include"], ["ticker", "weight_pct"]].sort_values("ticker").reset_index(drop=True)
+        if rec_res["end_assets_twd"].round(6).equals(cus_res["end_assets_twd"].round(6)) and not rec_weights.equals(cus_weights):
+            scenario_alerts.append("Custom 與 Recommended 的結果完全相同，但兩者權重不同，這很可疑，建議優先看驗證 / 除錯 tab。")
+    if scenario_alerts:
+        st.warning("\n\n".join(scenario_alerts))
+
     combo = pd.concat([
         cur_res.assign(portfolio="Current"),
         rec_res.assign(portfolio="Recommended"),
@@ -893,66 +925,82 @@ with main_tabs[4]:
     if validation_df.empty:
         validation_df = pd.DataFrame([{"檢查項目": "最小檢查集", "結果": "INFO", "說明": "目前尚未產生完整結果，但頁面已正常啟動。"}])
 
-    audit_tabs = st.tabs(["Current 假設", "Recommended 假設", "Custom 假設", "診斷摘要 / LOG"])
+    st.info("這一頁的目的不是秀漂亮圖，而是讓你看得出：每檔標的的模型假設從哪裡來、哪些是假設保守化、哪些其實資料不足。")
+    audit_choice = st.selectbox("選擇要查看的假設組", ["Current", "Recommended", "Custom", "診斷摘要 / LOG"], key="audit_choice")
     audit_keep = ["ticker","name","classification_bucket","hist_10y_cagr_pct","hist_10y_source","model_return_pct","model_return_method","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct","model_vol_method","confidence","notes","updated_at"]
-    with audit_tabs[0]:
+
+    global_settings = {
+        "fx_rate": fx_rate,
+        "start_assets_twd": start_assets_twd,
+        "simulation_years": simulation_years,
+        "rebalance_frequency_years": rebalance_frequency_years,
+        "withdrawal_strategy": withdrawal_strategy,
+        "cash_reserve_target_pct": cash_reserve_target_pct,
+        "monte_carlo_sims": monte_carlo_sims,
+        "salary_annual": salary_annual,
+        "salary_growth_pct": salary_growth_pct,
+        "retirement_age": retirement_age,
+        "tuotuozu_mode": tuotuozu_mode,
+        "tuotuozu_base_annual": tuotuozu_base_annual,
+        "tuotuozu_decay_pct": tuotuozu_decay_pct,
+        "living_expense_annual": living_expense_annual,
+        "inflation_pct": inflation_pct,
+        "edu_phase1_annual": edu_phase1_annual,
+        "edu_phase2_annual": edu_phase2_annual,
+        "mortgage_annual": mortgage_annual,
+        "inheritance_age": inheritance_age,
+        "inherited_rent_monthly": inherited_rent_monthly,
+    }
+    diagnostic_summary = build_diagnostic_summary(
+        scenario_name, global_settings, current_norm, recommended_norm, custom_norm, current_metrics, cur_sum, rec_sum, cus_sum, validation_df
+    )
+    mc_path_log = build_mc_path_log(
+        scenario_row.to_dict(), df_to_records(current_norm), df_to_records(recommended_norm),
+        simulation_years, start_assets_twd, CURRENT_AGE, CURRENT_YEAR, salary_annual, salary_growth_pct,
+        retirement_age, tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, biz_projection_list,
+        tuotuozu_fallback_mode, living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual,
+        mortgage_annual, inheritance_age, inherited_rent_monthly, withdrawal_strategy, rebalance_frequency_years,
+        mode_override_value, monte_carlo_sims, 42
+    )
+    full_log = build_full_log(
+        global_settings, current_norm, recommended_norm, custom_norm, scenario_row.to_dict(),
+        cur_res, rec_res, cus_res, validation_df, diagnostic_summary, mc_path_log
+    )
+
+    if audit_choice == "Current":
         st.dataframe(format_table_df(current_norm, pct_cols=["hist_10y_cagr_pct","model_return_pct","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct"], keep_cols=audit_keep), use_container_width=True, hide_index=True)
-    with audit_tabs[1]:
+    elif audit_choice == "Recommended":
         st.dataframe(format_table_df(recommended_norm, pct_cols=["hist_10y_cagr_pct","model_return_pct","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct"], keep_cols=audit_keep), use_container_width=True, hide_index=True)
-    with audit_tabs[2]:
+    elif audit_choice == "Custom":
         st.dataframe(format_table_df(custom_norm, pct_cols=["hist_10y_cagr_pct","model_return_pct","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct"], keep_cols=audit_keep), use_container_width=True, hide_index=True)
-    with audit_tabs[3]:
-        global_settings = {
-            "fx_rate": fx_rate,
-            "start_assets_twd": start_assets_twd,
-            "simulation_years": simulation_years,
-            "rebalance_frequency_years": rebalance_frequency_years,
-            "withdrawal_strategy": withdrawal_strategy,
-            "cash_reserve_target_pct": cash_reserve_target_pct,
-            "monte_carlo_sims": monte_carlo_sims,
-            "salary_annual": salary_annual,
-            "salary_growth_pct": salary_growth_pct,
-            "retirement_age": retirement_age,
-            "tuotuozu_mode": tuotuozu_mode,
-            "tuotuozu_base_annual": tuotuozu_base_annual,
-            "tuotuozu_decay_pct": tuotuozu_decay_pct,
-            "living_expense_annual": living_expense_annual,
-            "inflation_pct": inflation_pct,
-            "edu_phase1_annual": edu_phase1_annual,
-            "edu_phase2_annual": edu_phase2_annual,
-            "mortgage_annual": mortgage_annual,
-            "inheritance_age": inheritance_age,
-            "inherited_rent_monthly": inherited_rent_monthly,
-        }
-        diagnostic_summary = build_diagnostic_summary(
-            scenario_name, global_settings, current_norm, recommended_norm, custom_norm, current_metrics, cur_sum, rec_sum, cus_sum, validation_df
-        )
-        mc_path_log = build_mc_path_log(
-            scenario_row.to_dict(), df_to_records(current_norm), df_to_records(recommended_norm),
-            simulation_years, start_assets_twd, CURRENT_AGE, CURRENT_YEAR, salary_annual, salary_growth_pct,
-            retirement_age, tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, biz_projection_list,
-            tuotuozu_fallback_mode, living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual,
-            mortgage_annual, inheritance_age, inherited_rent_monthly, withdrawal_strategy, rebalance_frequency_years,
-            mode_override_value, monte_carlo_sims, 42
-        )
-        full_log = build_full_log(
-            global_settings, current_norm, recommended_norm, custom_norm, scenario_row.to_dict(),
-            cur_res, rec_res, cus_res, validation_df, diagnostic_summary, mc_path_log
-        )
+    else:
+        d1, d2 = st.columns(2)
+        d1.download_button("下載完整 LOG（JSON）", json.dumps(full_log, ensure_ascii=False, indent=2), "simulation_full_log.json", "application/json")
+        d2.download_button("下載診斷摘要（txt）", diagnostic_summary, "diagnostic_summary.txt", "text/plain")
         st.text_area("可直接複製的診斷摘要", diagnostic_summary, height=380)
-        c1, c2 = st.columns(2)
-        c1.download_button("下載完整 LOG（JSON）", json.dumps(full_log, ensure_ascii=False, indent=2), "simulation_full_log.json", "application/json")
-        c2.download_button("下載診斷摘要（txt）", diagnostic_summary, "diagnostic_summary.txt", "text/plain")
-        st.caption("若沒有真實10Y / 5Y / 3Y 價格資料，系統目前會清楚標示 unavailable / bucket default，不假裝精準。")
+        st.caption("若沒有真實 10Y / 5Y / 3Y 價格資料，系統會清楚標示 unavailable / bucket default，不假裝精準。")
 
 with main_tabs[5]:
     st.markdown("## 驗證 / 除錯")
     if 'validation_df' not in locals() or validation_df.empty:
         validation_df = pd.DataFrame([{"檢查項目": "最小檢查集", "結果": "INFO", "說明": "尚未產生完整模擬結果，但權重與缺值檢查已完成。"}])
-    v1, v2, v3 = st.columns(3)
+
+    st.info("這一頁是模型的體檢表。若這裡有 FAIL 或 WARNING，就不要急著相信最終資產數字。")
+    v1, v2, v3, v4 = st.columns(4)
     v1.metric("PASS 數", int((validation_df["結果"] == "PASS").sum()))
     v2.metric("WARNING 數", int((validation_df["結果"] == "WARNING").sum()))
     v3.metric("FAIL 數", int((validation_df["結果"] == "FAIL").sum()))
+    v4.metric("INFO 數", int((validation_df["結果"] == "INFO").sum()))
+
+    fail_df = validation_df.loc[validation_df["結果"] == "FAIL"]
+    warn_df = validation_df.loc[validation_df["結果"] == "WARNING"]
+    if not fail_df.empty:
+        st.error("目前有 FAIL 項目，建議先修模型再解讀結果。")
+    elif not warn_df.empty:
+        st.warning("目前有 WARNING 項目，代表這版模型還有需要人工判讀的地方。")
+    else:
+        st.success("目前最小檢查集皆通過。")
+
     st.dataframe(validation_df, use_container_width=True, hide_index=True)
 
     sens_rows = []
@@ -968,6 +1016,7 @@ with main_tabs[5]:
     st.dataframe(format_table_df(pd.DataFrame(sens_rows), human_cols=["低值","高值"]), use_container_width=True, hide_index=True)
 
 with main_tabs[6]:
+
     st.markdown("## 原始資料與下載")
     raw_tabs = st.tabs(["Current 正規化後", "Recommended 正規化後", "Custom 正規化後", "情境表", "Monte Carlo 明細"])
     with raw_tabs[0]:
