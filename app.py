@@ -168,7 +168,14 @@ with st.sidebar:
     rebalance_frequency_years = st.selectbox("再平衡頻率", options=[0, 1, 2, 3, 5], index=[0,1,2,3,5].index(int(saved.get("rebalance_frequency_years", defaults["rebalance_frequency_years"]))), format_func=lambda x: "不再平衡" if x == 0 else f"每 {x} 年", help="多久把持股比例拉回目標權重。新手建議每 1 年。")
     withdrawal_strategy = st.selectbox("現金不足時提領方式", ["比例賣出", "先賣現金 / ETF", "先賣波動低資產"], index=["比例賣出", "先賣現金 / ETF", "先賣波動低資產"].index(saved.get("withdrawal_strategy", "比例賣出")), help="生活費不夠時，系統要先賣哪一種資產。")
     cash_reserve_target_pct = st.slider("現金保留比重 %", 0.0, 40.0, float(saved.get("cash_reserve_target_pct", defaults["cash_reserve_target_pct"])), step=0.5, help="越高越穩，但成長性通常會下降。")
-    monte_carlo_sims = st.slider("Monte Carlo 次數", 100, 1500, int(saved.get("monte_carlo_sims", defaults["monte_carlo_sims"])), step=100, help="次數越高，勝率更穩定，但會比較慢。")
+    monte_carlo_sims = st.slider(
+    "Monte Carlo 次數",
+    100,
+    1500,
+    int(saved.get("monte_carlo_sims", defaults.get("monte_carlo_sims", 500))),
+    step=100,
+    help="次數越高，勝率更穩定，但會比較慢。"
+)
 
     st.header("3) 本業收入（加薪→退休）")
     salary_annual = st.number_input("本業年薪", min_value=0.0, value=float(saved.get("salary_annual", defaults["salary_annual"])), step=50000.0, help="你可支配的本業年度收入，不是公司營收。")
