@@ -751,6 +751,49 @@ def education_cost_for_year(calendar_year: int, phase_1_annual: float, phase_2_a
     return 0.0
 
 
+
+def portfolio_effective_stats(holdings: pd.DataFrame, scenario: pd.Series, year_index: int, mode_override: Optional[str]) -> Dict[str, float]:
+    start_total_assets = float(holdings["value_twd"].sum()) if not holdings.empty else 0.0
+    if start_total_assets <= 0:
+        return {
+            "base_portfolio_return_pct": 0.0,
+            "market_shift_pct": 0.0,
+            "weighted_ai_excess_shift_pct": 0.0,
+            "scenario_shift_pct": 0.0,
+            "effective_expected_return_pct": 0.0,
+            "effective_portfolio_vol_pct": 0.0,
+            "ai_direct_weight_pct": 0.0,
+            "base_portfolio_vol_pct": 0.0,
+        }
+    weights = holdings["value_twd"] / start_total_assets
+    base_portfolio_return_pct = float((holdings["expected_return"] * weights).sum() * 100.0)
+    base_portfolio_vol_pct = estimate_portfolio_volatility_pct(holdings)
+    ai_direct_weight_pct = float(weights[holdings["ai_direct"].fillna(False)].sum() * 100.0)
+    market_shift_pct = float(scenario.get("market_return_shift_pct", 0.0))
+    weighted_ai_excess_shift_pct = ai_direct_weight_pct * float(scenario.get("ai_excess_return_pct", 0.0)) / 100.0
+    vol_multiplier = float(scenario.get("vol_multiplier", 1.0))
+    mode = (mode_override or scenario.get("mode", "fixed") or "fixed").strip()
+    effective_expected_return_pct = base_portfolio_return_pct + market_shift_pct + weighted_ai_excess_shift_pct
+    if mode == "path":
+        early_years = int(scenario.get("early_negative_years", 0))
+        recovery_years = int(scenario.get("recovery_years", 0))
+        if year_index <= early_years:
+            effective_expected_return_pct = float(scenario.get("early_negative_return_pct", -10.0)) + ai_direct_weight_pct * float(scenario.get("early_ai_penalty_pct", 0.0)) / 100.0
+        elif year_index <= early_years + recovery_years:
+            effective_expected_return_pct = base_portfolio_return_pct + market_shift_pct + weighted_ai_excess_shift_pct + float(scenario.get("recovery_boost_pct", 0.0))
+    scenario_shift_pct = effective_expected_return_pct - base_portfolio_return_pct
+    effective_portfolio_vol_pct = base_portfolio_vol_pct * vol_multiplier
+    return {
+        "base_portfolio_return_pct": float(base_portfolio_return_pct),
+        "market_shift_pct": float(market_shift_pct),
+        "weighted_ai_excess_shift_pct": float(weighted_ai_excess_shift_pct),
+        "scenario_shift_pct": float(scenario_shift_pct),
+        "effective_expected_return_pct": float(effective_expected_return_pct),
+        "effective_portfolio_vol_pct": float(effective_portfolio_vol_pct),
+        "ai_direct_weight_pct": float(ai_direct_weight_pct),
+        "base_portfolio_vol_pct": float(base_portfolio_vol_pct),
+    }
+
 def simulate_portfolio(
     portfolio_df: pd.DataFrame,
     scenario: pd.Series,
@@ -1181,6 +1224,7 @@ def simulate_portfolio(
         age = start_age + year_idx - 1
         start_total_assets = float(holdings["value_twd"].sum())
 
+        effect_stats = portfolio_effective_stats(holdings, scenario, year_idx, mode_override)
         market_z = rng.standard_normal()
         group_zs = {group: rng.standard_normal() for group in set(holdings["risk_group"].tolist())}
         returns = []
@@ -1269,6 +1313,15 @@ def simulate_portfolio(
                 "calendar_year": cal_year,
                 "age": age,
                 "start_assets_twd": start_total_assets,
+                "base_portfolio_return_pct": effect_stats["base_portfolio_return_pct"],
+                "market_return_shift_pct": effect_stats["market_shift_pct"],
+                "weighted_ai_excess_shift_pct": effect_stats["weighted_ai_excess_shift_pct"],
+                "scenario_shift_pct": effect_stats["scenario_shift_pct"],
+                "effective_return_pct": effect_stats["effective_expected_return_pct"],
+                "effective_portfolio_return_pct": effect_stats["effective_expected_return_pct"],
+                "base_portfolio_vol_pct": effect_stats["base_portfolio_vol_pct"],
+                "effective_portfolio_vol_pct": effect_stats["effective_portfolio_vol_pct"],
+                "ai_direct_weight_pct": effect_stats["ai_direct_weight_pct"],
                 "portfolio_return_pct": portfolio_return_pct,
                 "portfolio_vol_estimate_pct": portfolio_vol_estimate_pct,
                 "intrayear_trough_assets_twd": intrayear_trough_assets_twd,
@@ -1302,6 +1355,7 @@ def simulate_portfolio(
 def run_monte_carlo_compare(
     current_portfolio: pd.DataFrame,
     recommended_portfolio: pd.DataFrame,
+    custom_portfolio: Optional[pd.DataFrame],
     scenario: pd.Series,
     years: int,
     start_assets_twd: float,
@@ -1328,43 +1382,54 @@ def run_monte_carlo_compare(
     simulations: int = 300,
     seed: int = 42,
 ) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    portfolio_inputs = {"Current": current_portfolio, "Recommended": recommended_portfolio}
+    if custom_portfolio is not None:
+        portfolio_inputs["Custom"] = custom_portfolio
+
     rows = []
     for i in range(simulations):
-        current_result = simulate_portfolio(
-            current_portfolio, scenario, years, start_assets_twd, start_age, current_year,
-            salary_annual, salary_growth_pct, retirement_age,
-            tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, tuotuozu_projection_list, tuotuozu_fallback_mode,
-            living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual, mortgage_annual,
-            inheritance_age, inherited_rent_monthly, withdrawal_strategy, rebalance_frequency_years, mode_override,
-            seed=seed + i * 2 + 1,
-        )
-        recommended_result = simulate_portfolio(
-            recommended_portfolio, scenario, years, start_assets_twd, start_age, current_year,
-            salary_annual, salary_growth_pct, retirement_age,
-            tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, tuotuozu_projection_list, tuotuozu_fallback_mode,
-            living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual, mortgage_annual,
-            inheritance_age, inherited_rent_monthly, withdrawal_strategy, rebalance_frequency_years, mode_override,
-            seed=seed + i * 2 + 2,
-        )
-        current_final = float(current_result.iloc[-1]["end_assets_twd"]) if not current_result.empty else 0.0
-        recommended_final = float(recommended_result.iloc[-1]["end_assets_twd"]) if not recommended_result.empty else 0.0
-        current_ruin = int((current_result["uncovered_deficit_twd"] > 0).any() or (current_result["end_assets_twd"] <= 0).any()) if not current_result.empty else 1
-        recommended_ruin = int((recommended_result["uncovered_deficit_twd"] > 0).any() or (recommended_result["end_assets_twd"] <= 0).any()) if not recommended_result.empty else 1
-        rows.append({
-            "simulation": i + 1,
-            "current_final_assets_twd": current_final,
-            "recommended_final_assets_twd": recommended_final,
-            "current_ruin": current_ruin,
-            "recommended_ruin": recommended_ruin,
-            "recommended_beats_current": int(recommended_final > current_final),
-        })
+        sim_row = {"simulation": i + 1}
+        finals = {}
+        seed_bump = 1
+        for name, portfolio in portfolio_inputs.items():
+            result = simulate_portfolio(
+                portfolio, scenario, years, start_assets_twd, start_age, current_year,
+                salary_annual, salary_growth_pct, retirement_age,
+                tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, tuotuozu_projection_list, tuotuozu_fallback_mode,
+                living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual, mortgage_annual,
+                inheritance_age, inherited_rent_monthly, withdrawal_strategy, rebalance_frequency_years, mode_override,
+                seed=seed + i * 10 + seed_bump,
+            )
+            final_assets = float(result.iloc[-1]["end_assets_twd"]) if not result.empty else 0.0
+            ruin_flag = int((result["uncovered_deficit_twd"] > 0).any() or (result["end_assets_twd"] <= 0).any()) if not result.empty else 1
+            max_drawdown = float(result["drawdown_pct"].min()) if not result.empty else -100.0
+            key = name.lower()
+            sim_row[f"{key}_final_assets_twd"] = final_assets
+            sim_row[f"{key}_ruin"] = ruin_flag
+            sim_row[f"{key}_max_drawdown_pct"] = max_drawdown
+            finals[name] = final_assets
+            seed_bump += 1
+        sim_row["recommended_beats_current"] = int(finals.get("Recommended", 0.0) > finals.get("Current", 0.0))
+        if "Custom" in finals:
+            sim_row["recommended_beats_custom"] = int(finals.get("Recommended", 0.0) > finals.get("Custom", 0.0))
+            sim_row["current_beats_custom"] = int(finals.get("Current", 0.0) > finals.get("Custom", 0.0))
+        rows.append(sim_row)
     sims = pd.DataFrame(rows)
-    metrics = {
-        "A 方案勝過 B 方案的機率": float((1.0 - sims["recommended_beats_current"].mean()) * 100.0),
-        "B 方案勝過 A 方案的機率": float(sims["recommended_beats_current"].mean() * 100.0),
-        "Current 資產耗盡機率": float(sims["current_ruin"].mean() * 100.0),
-        "Recommended 資產耗盡機率": float(sims["recommended_ruin"].mean() * 100.0),
-        "Current 終值中位數": float(sims["current_final_assets_twd"].median()),
-        "Recommended 終值中位數": float(sims["recommended_final_assets_twd"].median()),
-    }
+    metrics: Dict[str, float] = {}
+    for name in portfolio_inputs:
+        key = name.lower()
+        final_col = f"{key}_final_assets_twd"
+        ruin_col = f"{key}_ruin"
+        drawdown_col = f"{key}_max_drawdown_pct"
+        metrics[f"{name} P50 終值"] = float(sims[final_col].median())
+        metrics[f"{name} P25 終值"] = float(sims[final_col].quantile(0.25))
+        metrics[f"{name} P75 終值"] = float(sims[final_col].quantile(0.75))
+        metrics[f"{name} P5 Worst Case 終值"] = float(sims[final_col].quantile(0.05))
+        metrics[f"{name} 資產耗盡機率"] = float(sims[ruin_col].mean() * 100.0)
+        metrics[f"{name} 最大回撤中位數"] = float(sims[drawdown_col].median())
+    metrics["Recommended 勝過 Current 機率"] = float(sims["recommended_beats_current"].mean() * 100.0)
+    if "recommended_beats_custom" in sims.columns:
+        metrics["Recommended 勝過 Custom 機率"] = float(sims["recommended_beats_custom"].mean() * 100.0)
+    if "current_beats_custom" in sims.columns:
+        metrics["Current 勝過 Custom 機率"] = float(sims["current_beats_custom"].mean() * 100.0)
     return sims, metrics

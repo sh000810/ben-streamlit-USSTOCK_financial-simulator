@@ -40,8 +40,8 @@ SAMPLE_BIZ_XLSX = DATA_DIR / "妥妥租_預測.xlsx"
 SETTINGS_PATH = DATA_DIR / "user_saved_settings.json"
 
 st.set_page_config(page_title="Ben 財務與投資模擬器", layout="wide")
-st.title("Ben 財務與投資模擬器 · 透明化驗算版 v7.1")
-st.caption("加入：數字格式統一、側邊欄可讀值提示、Assumption Audit、完整 LOG / 診斷摘要、驗證 tab 補齊、模型假設透明化。")
+st.title("Ben 財務與投資模擬器 · 透明化驗算版 v7.5")
+st.caption("加入：Cash bucket 修正、組合加權報酬/波動、情境額外加成揭露、單一路徑與 Monte Carlo 明確分離、年度生效報酬 LOG。")
 
 st.markdown("""
 <style>
@@ -144,6 +144,8 @@ def detect_bucket(row: pd.Series) -> str:
     ticker = str(row.get("ticker", "")).upper().strip()
     asset_class = str(row.get("asset_class", "")).lower()
     role_bucket = str(row.get("role_bucket", "")).lower()
+    if ticker in {"CASH", "CASH & CASH INVESTMENTS"} or "cash" in asset_class:
+        return "cash"
     if ticker in SUPER_WINNER_AI:
         return "ai_super_winner"
     if ticker in MEGA_CAP_AI:
@@ -166,7 +168,10 @@ def assumption_from_bucket(row: pd.Series) -> Dict[str, Any]:
     legacy_return = float(row.get("expected_return_pct", 0) or 0)
     legacy_vol = float(row.get("volatility_pct", 0) or 0)
 
-    if bucket == "ai_super_winner":
+    if bucket == "cash":
+        rule_return, rule_vol = 1.5, 0.0
+        note = "現金 / 類現金，固定以 1.5% 報酬、0% 波動處理。"
+    elif bucket == "ai_super_winner":
         rule_return, rule_vol = 10.0, max(32.0, legacy_vol or 0)
         note = "AI爆發股，模型值採保守折現；若未接真實10年價格資料，先用規則預設。"
     elif bucket == "mega_cap_ai":
@@ -207,6 +212,9 @@ def assumption_from_bucket(row: pd.Series) -> Dict[str, Any]:
         elif bucket == "speculative":
             model_return = min(max(float(hist) * 0.25, 3.0), 6.0)
             method = "speculative_hist_discount"
+        elif bucket == "cash":
+            model_return = rule_return
+            method = "cash_fixed_1p5_0vol"
         else:
             model_return = rule_return
             method = f"bucket_default_{bucket}"
@@ -214,13 +222,17 @@ def assumption_from_bucket(row: pd.Series) -> Dict[str, Any]:
         hist_source = row.get("hist_10y_source", "manual")
     else:
         model_return = rule_return
-        method = f"bucket_default_{bucket}"
-        confidence = "low"
-        hist_source = row.get("hist_10y_source", "unavailable")
+        method = "cash_fixed_1p5_0vol" if bucket == "cash" else f"bucket_default_{bucket}"
+        confidence = "high" if bucket == "cash" else "low"
+        hist_source = row.get("hist_10y_source", "rule_based_cash") if bucket == "cash" else row.get("hist_10y_source", "unavailable")
 
     vol_5y = row.get("vol_5y_weekly_pct", None)
     vol_3y = row.get("vol_3y_weekly_pct", None)
-    if pd.notna(vol_5y) and pd.notna(vol_3y):
+    if bucket == "cash":
+        model_vol = 0.0
+        vol_method = "cash_fixed_zero_vol"
+        confidence = "high"
+    elif pd.notna(vol_5y) and pd.notna(vol_3y):
         model_vol = 0.6 * float(vol_5y) + 0.4 * float(vol_3y)
         vol_method = "0.6 * vol_5y_weekly_pct + 0.4 * vol_3y_weekly_pct"
         confidence = "high" if confidence != "low" else "medium"
@@ -348,6 +360,55 @@ def scenario_context_df(scenario_row: pd.Series, scenario_name: str, mode_overri
         }
     ])
 
+
+
+
+def portfolio_scenario_effect_rows(current_df: pd.DataFrame, recommended_df: pd.DataFrame, custom_df: pd.DataFrame, scenario_row: pd.Series, mode_override_value: str | None) -> pd.DataFrame:
+    rows = []
+    mode_name = (mode_override_value or scenario_row.get("mode", "fixed") or "fixed")
+    market_shift_pct = float(scenario_row.get("market_return_shift_pct", 0.0))
+    ai_excess_pct = float(scenario_row.get("ai_excess_return_pct", 0.0))
+    vol_multiplier = float(scenario_row.get("vol_multiplier", 1.0))
+    recovery_boost_pct = float(scenario_row.get("recovery_boost_pct", 0.0))
+    early_negative_return_pct = float(scenario_row.get("early_negative_return_pct", 0.0))
+    early_ai_penalty_pct = float(scenario_row.get("early_ai_penalty_pct", 0.0))
+    early_negative_years = int(scenario_row.get("early_negative_years", 0))
+    recovery_years = int(scenario_row.get("recovery_years", 0))
+
+    for name, df in [("Current", current_df), ("Recommended", recommended_df), ("Custom", custom_df)]:
+        included = df[df.get("include", True)].copy()
+        included = normalize_weights(included) if not included.empty else included
+        weights = pd.to_numeric(included.get("weight_pct", 0), errors="coerce").fillna(0.0)
+        returns = pd.to_numeric(included.get("expected_return_pct", 0), errors="coerce").fillna(0.0)
+        vols = pd.to_numeric(included.get("volatility_pct", 0), errors="coerce").fillna(0.0)
+        ai_flags = included.get("ai_direct", pd.Series(False, index=included.index)).fillna(False).astype(bool)
+        base_return_pct = float((returns * weights).sum() / 100.0) if not included.empty else 0.0
+        base_vol_pct = float((vols * weights).sum() / 100.0) if not included.empty else 0.0
+        ai_weight_pct = float(weights[ai_flags].sum()) if not included.empty else 0.0
+        weighted_ai_excess_shift_pct = ai_weight_pct * ai_excess_pct / 100.0
+        scenario_shift_pct = market_shift_pct + weighted_ai_excess_shift_pct
+        effective_portfolio_return_pct = base_return_pct + scenario_shift_pct
+        if mode_name == "path":
+            if early_negative_years > 0:
+                effective_portfolio_return_pct = early_negative_return_pct + ai_weight_pct * early_ai_penalty_pct / 100.0
+                scenario_shift_pct = effective_portfolio_return_pct - base_return_pct
+            elif recovery_years > 0:
+                effective_portfolio_return_pct = base_return_pct + market_shift_pct + weighted_ai_excess_shift_pct + recovery_boost_pct
+                scenario_shift_pct = effective_portfolio_return_pct - base_return_pct
+        rows.append({
+            "方案": name,
+            "基礎加權報酬率%": base_return_pct,
+            "基礎加權波動率%": base_vol_pct,
+            "AI 直接曝險權重%": ai_weight_pct,
+            "market_return_shift_pct": market_shift_pct,
+            "weighted_ai_excess_shift_pct": weighted_ai_excess_shift_pct,
+            "scenario_shift_pct": scenario_shift_pct,
+            "effective_portfolio_return_pct": effective_portfolio_return_pct,
+            "vol_multiplier": vol_multiplier,
+            "effective_portfolio_vol_pct": base_vol_pct * vol_multiplier,
+            "模擬模式": mode_name,
+        })
+    return pd.DataFrame(rows)
 
 def build_validation_checks(current_df: pd.DataFrame, recommended_df: pd.DataFrame, custom_df: pd.DataFrame, rec_res: pd.DataFrame | None, cur_res: pd.DataFrame | None, cus_res: pd.DataFrame | None, tuotuozu_mode: str, biz_projection_list: List[float], retirement_age: int, edu_phase2_annual: float, scenario_name: str) -> pd.DataFrame:
     checks = []
@@ -491,8 +552,9 @@ def build_mc_path_log(
             }
             temp = temp.rename(columns=rename_map)
             keep_cols = [
-                "portfolio","simulation_id","random_seed","year_index","calendar_year","begin_assets_twd","portfolio_return_pct",
-                "investment_gain_twd","salary_income_twd","tuotuozu_income_twd","inheritance_income_twd","total_income_twd",
+                "portfolio","simulation_id","random_seed","year_index","calendar_year","begin_assets_twd",
+                "base_portfolio_return_pct","market_return_shift_pct","weighted_ai_excess_shift_pct","scenario_shift_pct","effective_return_pct",
+                "portfolio_return_pct","investment_gain_twd","salary_income_twd","tuotuozu_income_twd","inheritance_income_twd","total_income_twd",
                 "living_expense_twd","edu_expense_twd","mortgage_twd","withdrawal_twd","end_assets_twd","peak_assets_twd",
                 "drawdown_pct","net_cashflow_twd","uncovered_deficit_twd","ruin_flag"
             ]
@@ -989,6 +1051,7 @@ diagnostic_summary = build_diagnostic_summary(
 )
 portfolio_context_df = portfolio_context_rows(current_norm, recommended_norm, custom_norm)
 scenario_context_runtime_df = scenario_context_df(scenario_row, scenario_name, mode_override_value)
+portfolio_effect_df = portfolio_scenario_effect_rows(current_norm, recommended_norm, custom_norm, scenario_row, mode_override_value)
 light_log = build_full_log(
     global_settings, current_norm, recommended_norm, custom_norm, scenario_row.to_dict(),
     cur_res, rec_res, cus_res, validation_df, diagnostic_summary, []
@@ -1034,6 +1097,10 @@ with main_tabs[2]:
     rec_sum = summarize_simulation(rec_res, start_assets_twd)
     cus_sum = summarize_simulation(cus_res, start_assets_twd)
 
+    st.info("這一頁是單一路徑 deterministic 模擬：適合看方向與年度曲線，但不代表機率分布真相。Monte Carlo 請看下一頁。")
+    st.markdown("### 組合基礎加權報酬 / 波動 與情境額外加成")
+    st.dataframe(format_table_df(portfolio_effect_df, pct_cols=["基礎加權報酬率%","基礎加權波動率%","AI 直接曝險權重%","market_return_shift_pct","weighted_ai_excess_shift_pct","scenario_shift_pct","effective_portfolio_return_pct","effective_portfolio_vol_pct"]), use_container_width=True, hide_index=True)
+
     s1,s2,s3,s4 = st.columns(4)
     s1.metric("Current 最終資產", fmt_human(cur_sum.get("最終資產終值"), 1))
     s2.metric("Recommended 最終資產", fmt_human(rec_sum.get("最終資產終值"), 1))
@@ -1050,6 +1117,14 @@ with main_tabs[2]:
             scenario_alerts.append("Custom 與 Recommended 的結果完全相同，但兩者權重不同，這很可疑，建議優先看驗證 / 除錯 tab。")
     if scenario_alerts:
         st.warning("\n\n".join(scenario_alerts))
+
+    single_path_summary_df = pd.DataFrame([
+        {"方案": "Current", "終值": cur_sum.get("最終資產終值"), "最大回撤%": cur_sum.get("最大回撤 %"), "effective_portfolio_return_pct": float(portfolio_effect_df.loc[portfolio_effect_df["方案"].eq("Current"), "effective_portfolio_return_pct"].iloc[0]), "effective_portfolio_vol_pct": float(portfolio_effect_df.loc[portfolio_effect_df["方案"].eq("Current"), "effective_portfolio_vol_pct"].iloc[0])},
+        {"方案": "Recommended", "終值": rec_sum.get("最終資產終值"), "最大回撤%": rec_sum.get("最大回撤 %"), "effective_portfolio_return_pct": float(portfolio_effect_df.loc[portfolio_effect_df["方案"].eq("Recommended"), "effective_portfolio_return_pct"].iloc[0]), "effective_portfolio_vol_pct": float(portfolio_effect_df.loc[portfolio_effect_df["方案"].eq("Recommended"), "effective_portfolio_vol_pct"].iloc[0])},
+        {"方案": "Custom", "終值": cus_sum.get("最終資產終值"), "最大回撤%": cus_sum.get("最大回撤 %"), "effective_portfolio_return_pct": float(portfolio_effect_df.loc[portfolio_effect_df["方案"].eq("Custom"), "effective_portfolio_return_pct"].iloc[0]), "effective_portfolio_vol_pct": float(portfolio_effect_df.loc[portfolio_effect_df["方案"].eq("Custom"), "effective_portfolio_vol_pct"].iloc[0])},
+    ])
+    st.markdown("### 單一路徑結果摘要")
+    st.dataframe(format_table_df(single_path_summary_df, pct_cols=["最大回撤%","effective_portfolio_return_pct","effective_portfolio_vol_pct"], human_cols=["終值"]), use_container_width=True, hide_index=True)
 
     combo = pd.concat([
         cur_res.assign(portfolio="Current"),
@@ -1102,19 +1177,28 @@ with main_tabs[3]:
         matrix_df = pd.DataFrame(matrix_rows)
         st.dataframe(format_table_df(matrix_df, pct_cols=["Current 最大回撤%","Recommended 最大回撤%"], human_cols=["Current 最終資產","Recommended 最終資產"]), use_container_width=True, hide_index=True)
 
+        st.info("這一頁是 Monte Carlo 機率分布：適合看 P50 / P5 worst case / 資產耗盡機率，不要和單一路徑混在一起解讀。")
         sims_df, mc_metrics = run_monte_carlo_compare(
-            current_norm, recommended_norm, scenario_row, simulation_years, start_assets_twd, CURRENT_AGE, CURRENT_YEAR,
+            current_norm, recommended_norm, custom_norm, scenario_row, simulation_years, start_assets_twd, CURRENT_AGE, CURRENT_YEAR,
             salary_annual, salary_growth_pct, retirement_age, tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, biz_projection_list, tuotuozu_fallback_mode,
             living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual, mortgage_annual, inheritance_age, inherited_rent_monthly,
             withdrawal_strategy, rebalance_frequency_years, mode_override_value, simulations=monte_carlo_sims, seed=42
         )
-        m1,m2,m3,m4 = st.columns(4)
-        m1.metric("Recommended 勝過 Current 機率", fmt_pct(mc_metrics.get("B 方案勝過 A 方案的機率"),1))
-        m2.metric("Current 資產耗盡機率", fmt_pct(mc_metrics.get("Current 資產耗盡機率"),1))
-        m3.metric("Recommended 資產耗盡機率", fmt_pct(mc_metrics.get("Recommended 資產耗盡機率"),1))
-        m4.metric("Recommended 中位數終值", fmt_human(mc_metrics.get("Recommended 終值中位數"),1))
-        long_mc = sims_df.melt(value_vars=["current_final_assets_twd","recommended_final_assets_twd"], var_name="portfolio", value_name="final_assets_twd")
+        mc_summary_df = pd.DataFrame([
+            {"方案": "Current", "P50 終值": mc_metrics.get("Current P50 終值"), "P25 終值": mc_metrics.get("Current P25 終值"), "P75 終值": mc_metrics.get("Current P75 終值"), "P5 Worst Case": mc_metrics.get("Current P5 Worst Case 終值"), "資產耗盡機率%": mc_metrics.get("Current 資產耗盡機率"), "最大回撤中位數%": mc_metrics.get("Current 最大回撤中位數")},
+            {"方案": "Recommended", "P50 終值": mc_metrics.get("Recommended P50 終值"), "P25 終值": mc_metrics.get("Recommended P25 終值"), "P75 終值": mc_metrics.get("Recommended P75 終值"), "P5 Worst Case": mc_metrics.get("Recommended P5 Worst Case 終值"), "資產耗盡機率%": mc_metrics.get("Recommended 資產耗盡機率"), "最大回撤中位數%": mc_metrics.get("Recommended 最大回撤中位數")},
+            {"方案": "Custom", "P50 終值": mc_metrics.get("Custom P50 終值"), "P25 終值": mc_metrics.get("Custom P25 終值"), "P75 終值": mc_metrics.get("Custom P75 終值"), "P5 Worst Case": mc_metrics.get("Custom P5 Worst Case 終值"), "資產耗盡機率%": mc_metrics.get("Custom 資產耗盡機率"), "最大回撤中位數%": mc_metrics.get("Custom 最大回撤中位數")},
+        ])
+        st.markdown("### Monte Carlo 結果摘要")
+        st.dataframe(format_table_df(mc_summary_df, pct_cols=["資產耗盡機率%","最大回撤中位數%"], human_cols=["P50 終值","P25 終值","P75 終值","P5 Worst Case"]), use_container_width=True, hide_index=True)
+        m1,m2,m3 = st.columns(3)
+        m1.metric("Recommended 勝過 Current 機率", fmt_pct(mc_metrics.get("Recommended 勝過 Current 機率"),1))
+        m2.metric("Recommended 勝過 Custom 機率", fmt_pct(mc_metrics.get("Recommended 勝過 Custom 機率"),1))
+        m3.metric("Current 勝過 Custom 機率", fmt_pct(mc_metrics.get("Current 勝過 Custom 機率"),1))
+        long_mc = sims_df.melt(value_vars=["current_final_assets_twd","recommended_final_assets_twd","custom_final_assets_twd"], var_name="portfolio", value_name="final_assets_twd")
         st.plotly_chart(px.histogram(long_mc, x="final_assets_twd", color="portfolio", barmode="overlay", nbins=40, title="Monte Carlo 終值分布"), use_container_width=True)
+        dd_long = sims_df.melt(value_vars=["current_max_drawdown_pct","recommended_max_drawdown_pct","custom_max_drawdown_pct"], var_name="portfolio", value_name="max_drawdown_pct")
+        st.plotly_chart(px.histogram(dd_long, x="max_drawdown_pct", color="portfolio", barmode="overlay", nbins=40, title="Monte Carlo 最大回撤分布"), use_container_width=True)
 
 with main_tabs[4]:
     try:
@@ -1123,6 +1207,7 @@ with main_tabs[4]:
         st.markdown("### 目前實際吃進模擬的配置 / 情境")
         st.dataframe(format_table_df(portfolio_context_df, pct_cols=["現金%","加權報酬%","加權波動%"]), use_container_width=True, hide_index=True)
         st.dataframe(format_table_df(scenario_context_runtime_df, pct_cols=["market_shift%","ai_excess%","max_drawdown_hint%"]), use_container_width=True, hide_index=True)
+        st.dataframe(format_table_df(portfolio_effect_df, pct_cols=["基礎加權報酬率%","基礎加權波動率%","AI 直接曝險權重%","market_return_shift_pct","weighted_ai_excess_shift_pct","scenario_shift_pct","effective_portfolio_return_pct","effective_portfolio_vol_pct"]), use_container_width=True, hide_index=True)
         audit_choice = st.selectbox("選擇要查看的假設組", ["Current", "Recommended", "Custom", "診斷摘要 / LOG"], key="audit_choice")
         audit_keep = ["ticker","name","classification_bucket","hist_10y_cagr_pct","hist_10y_source","model_return_pct","model_return_method","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct","model_vol_method","confidence","notes","updated_at"]
 
@@ -1164,6 +1249,7 @@ with main_tabs[5]:
         st.markdown("### 目前實際吃進模擬的配置 / 情境")
         st.dataframe(format_table_df(portfolio_context_df, pct_cols=["現金%","加權報酬%","加權波動%"]), use_container_width=True, hide_index=True)
         st.dataframe(format_table_df(scenario_context_runtime_df, pct_cols=["market_shift%","ai_excess%","max_drawdown_hint%"]), use_container_width=True, hide_index=True)
+        st.dataframe(format_table_df(portfolio_effect_df, pct_cols=["基礎加權報酬率%","基礎加權波動率%","AI 直接曝險權重%","market_return_shift_pct","weighted_ai_excess_shift_pct","scenario_shift_pct","effective_portfolio_return_pct","effective_portfolio_vol_pct"]), use_container_width=True, hide_index=True)
         if validation_df.empty:
             validation_df = pd.DataFrame([{"檢查項目": "最小檢查集", "結果": "INFO", "說明": "尚未產生完整模擬結果，但權重與缺值檢查已完成。"}])
 
