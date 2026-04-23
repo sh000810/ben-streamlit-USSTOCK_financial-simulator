@@ -868,6 +868,7 @@ def default_control_values(uploaded_total_usd: Optional[float], fx_rate: float) 
         "simulation_years": 20,
         "rebalance_frequency_years": 1,
         "cash_reserve_target_pct": 8.0,
+        "monte_carlo_sims": 500,
     }
 
 
