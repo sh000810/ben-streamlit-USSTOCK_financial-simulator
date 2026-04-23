@@ -41,9 +41,12 @@ SAMPLE_CSV = DATA_DIR / "Individual-Positions-2026-04-22-184253(1).csv"
 SAMPLE_BIZ_XLSX = DATA_DIR / "妥妥租_預測.xlsx"
 SETTINGS_PATH = DATA_DIR / "user_saved_settings.json"
 
+EXTERNAL_ASSUMPTIONS_DF = pd.DataFrame()
+EXTERNAL_ASSUMPTIONS_STATUS = "未匯入"
+
 st.set_page_config(page_title="Ben 財務與投資模擬器", layout="wide")
-st.title("Ben 財務與投資模擬器 · 透明化驗算版 v7.7")
-st.caption("加入：Cash bucket 修正、組合加權報酬/波動、情境額外加成揭露、單一路徑與 Monte Carlo 明確分離、年度生效報酬 LOG、AI 驗證包 ZIP 一鍵下載。")
+st.title("Ben 財務與投資模擬器 · 透明化驗算版 v7.8")
+st.caption("加入：Cash bucket 修正、組合加權報酬/波動、情境額外加成揭露、單一路徑與 Monte Carlo 明確分離、年度生效報酬 LOG、AI 驗證包 ZIP 一鍵下載、歷史假設資料匯入。")
 
 st.markdown("""
 <style>
@@ -259,7 +262,7 @@ def assumption_from_bucket(row: pd.Series) -> Dict[str, Any]:
 
 
 def enrich_assumptions(df: pd.DataFrame) -> pd.DataFrame:
-    work = df.copy()
+    work = merge_external_assumptions(df.copy())
     for col, default in {
         "hist_10y_cagr_pct": pd.NA,
         "hist_10y_source": "unavailable",
@@ -288,6 +291,118 @@ def prepare_simulation_df(df: pd.DataFrame) -> pd.DataFrame:
     work["expected_return_pct"] = pd.to_numeric(work["model_return_pct"], errors="coerce").fillna(pd.to_numeric(work.get("expected_return_pct"), errors="coerce")).fillna(0.0)
     work["volatility_pct"] = pd.to_numeric(work["model_vol_pct"], errors="coerce").fillna(pd.to_numeric(work.get("volatility_pct"), errors="coerce")).fillna(0.0)
     return work
+
+
+def build_hist_assumption_template() -> pd.DataFrame:
+    return pd.DataFrame([
+        {
+            "ticker": "NVDA",
+            "hist_10y_cagr_pct": 35.0,
+            "hist_10y_source": "manual_example",
+            "vol_3y_weekly_pct": 34.0,
+            "vol_5y_weekly_pct": 30.0,
+            "model_return_pct": pd.NA,
+            "model_return_method": "",
+            "model_vol_pct": pd.NA,
+            "model_vol_method": "",
+            "confidence": "medium",
+            "notes": "example row",
+            "updated_at": datetime.now().strftime("%Y-%m-%d"),
+        }
+    ])
+
+
+def normalize_external_assumptions_df(df: pd.DataFrame) -> pd.DataFrame:
+    work = df.copy()
+    work.columns = [str(c).strip() for c in work.columns]
+    lower_map = {str(c).strip().lower(): c for c in work.columns}
+    if "ticker" not in lower_map:
+        return pd.DataFrame()
+    work = work.rename(columns={lower_map["ticker"]: "ticker"})
+    work["ticker"] = work["ticker"].astype(str).str.upper().str.strip()
+    allowed = [
+        "ticker", "hist_10y_cagr_pct", "hist_10y_source", "vol_3y_weekly_pct", "vol_5y_weekly_pct",
+        "model_return_pct", "model_return_method", "model_vol_pct", "model_vol_method",
+        "confidence", "notes", "updated_at"
+    ]
+    for col in allowed:
+        if col not in work.columns:
+            work[col] = pd.NA
+    for col in ["hist_10y_cagr_pct", "vol_3y_weekly_pct", "vol_5y_weekly_pct", "model_return_pct", "model_vol_pct"]:
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+    return work[allowed].drop_duplicates(subset=["ticker"], keep="last")
+
+
+def merge_external_assumptions(work: pd.DataFrame) -> pd.DataFrame:
+    global EXTERNAL_ASSUMPTIONS_DF
+    if work.empty or EXTERNAL_ASSUMPTIONS_DF.empty or "ticker" not in work.columns:
+        return work
+    merged = work.copy()
+    merged["ticker"] = merged["ticker"].astype(str).str.upper().str.strip()
+    ext = EXTERNAL_ASSUMPTIONS_DF.copy()
+    ext_cols = [c for c in ext.columns if c != "ticker"]
+    merged = merged.merge(ext, on="ticker", how="left", suffixes=("", "__ext"))
+    for col in ext_cols:
+        ext_col = f"{col}__ext"
+        if ext_col in merged.columns:
+            if col in merged.columns:
+                merged[col] = merged[ext_col].combine_first(merged[col])
+            else:
+                merged[col] = merged[ext_col]
+            merged = merged.drop(columns=[ext_col])
+    return merged
+
+
+def build_assumption_coverage_df(df: pd.DataFrame, label: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame([{
+            "方案": label, "總筆數": 0, "hist_10y 覆蓋率%": 0.0, "vol_3y 覆蓋率%": 0.0, "vol_5y 覆蓋率%": 0.0, "外部匯入來源筆數": 0
+        }])
+    rows = len(df)
+    hist_cov = float(pd.to_numeric(df.get("hist_10y_cagr_pct"), errors="coerce").notna().mean() * 100) if rows else 0.0
+    vol3_cov = float(pd.to_numeric(df.get("vol_3y_weekly_pct"), errors="coerce").notna().mean() * 100) if rows else 0.0
+    vol5_cov = float(pd.to_numeric(df.get("vol_5y_weekly_pct"), errors="coerce").notna().mean() * 100) if rows else 0.0
+    source_series = df.get("hist_10y_source", pd.Series(dtype=object)).fillna("").astype(str) if rows else pd.Series(dtype=object)
+    ext_count = int(source_series.str.contains("manual|csv|import|uploaded", case=False, regex=True).sum()) if rows else 0
+    return pd.DataFrame([{
+        "方案": label, "總筆數": rows, "hist_10y 覆蓋率%": hist_cov, "vol_3y 覆蓋率%": vol3_cov, "vol_5y 覆蓋率%": vol5_cov, "外部匯入來源筆數": ext_count
+    }])
+
+
+def build_ai_validation_prompt(
+    *,
+    scenario_name: str,
+    global_settings: Dict[str, Any],
+    validation_df: pd.DataFrame,
+    portfolio_effect_df: pd.DataFrame,
+) -> str:
+    warning_items = validation_df.loc[validation_df["結果"].isin(["WARNING", "FAIL"]), ["檢查項目", "結果", "說明"]] if not validation_df.empty else pd.DataFrame()
+    warning_block = warning_items.to_csv(index=False) if not warning_items.empty else "無"
+    effect_block = portfolio_effect_df.to_csv(index=False) if not portfolio_effect_df.empty else "無"
+    return f"""請根據這個驗證包檢查 Ben 財務與投資模擬器的結果是否合理。
+
+檢查重點：
+1. 三組組合（Current / Recommended / Custom）的權重是否真的進入模擬。
+2. base_portfolio_return_pct、scenario_shift_pct、effective_return_pct 的關係是否一致。
+3. deterministic 單一路徑與 Monte Carlo 摘要是否互相矛盾。
+4. validation 的 WARNING / FAIL 是否會影響最終結論。
+5. 若發現數字不合理，請指出最可能的邏輯來源，而不是只說『看起來怪』。
+
+當前情境：{scenario_name}
+模擬年數：{global_settings.get('simulation_years')}
+起始資產：{global_settings.get('start_assets_twd')}
+
+目前 WARNING / FAIL：
+{warning_block}
+
+目前組合 / 情境效果表：
+{effect_block}
+
+回答格式請用：
+- 先結論
+- 再分成：事實 / 推論 / 假設
+- 最後列出 3 個最大不確定點
+"""
 
 
 def format_table_df(df: pd.DataFrame, pct_cols: List[str] | None = None, human_cols: List[str] | None = None, keep_cols: List[str] | None = None) -> pd.DataFrame:
@@ -738,6 +853,12 @@ def build_validation_bundle_zip(
 包類型：{bundle_kind}
 產生時間：{timestamp}
 """
+    ai_validation_prompt = build_ai_validation_prompt(
+        scenario_name=str(scenario_row_dict.get("scenario_name", "未命名情境")),
+        global_settings=global_settings,
+        validation_df=validation_df,
+        portfolio_effect_df=portfolio_effect_df,
+    )
     manifest = {
         "bundle_kind": bundle_kind,
         "generated_at": timestamp,
@@ -755,6 +876,7 @@ def build_validation_bundle_zip(
 
     with zipfile.ZipFile(bio, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         _writestr(zf, "README.txt", readme)
+        _writestr(zf, "AI_VALIDATION_PROMPT.txt", prepare_text_download(ai_validation_prompt))
         _writestr(zf, "manifest.json", prepare_json_download(manifest))
         _writestr(zf, "logs/diagnostic_summary.txt", prepare_text_download(diagnostic_summary))
         _writestr(zf, "logs/light_log.json", prepare_json_download(light_log))
@@ -836,6 +958,26 @@ with st.sidebar:
         key="source_mode",
     )
     uploaded_csv = st.file_uploader("上傳持股 CSV", type=["csv"], key="uploaded_csv")
+    hist_template = build_hist_assumption_template()
+    st.download_button("下載歷史假設 CSV 範本", prepare_download(hist_template), "historical_assumptions_template.csv", "text/csv")
+    uploaded_hist_assumptions = st.file_uploader("上傳歷史假設 CSV（選填）", type=["csv"], key="uploaded_hist_assumptions")
+    if uploaded_hist_assumptions is not None:
+        try:
+            _raw_hist_df = pd.read_csv(uploaded_hist_assumptions)
+            EXTERNAL_ASSUMPTIONS_DF = normalize_external_assumptions_df(_raw_hist_df)
+            if EXTERNAL_ASSUMPTIONS_DF.empty:
+                EXTERNAL_ASSUMPTIONS_STATUS = "匯入失敗：缺少 ticker 欄位"
+                st.warning(EXTERNAL_ASSUMPTIONS_STATUS)
+            else:
+                EXTERNAL_ASSUMPTIONS_STATUS = f"已匯入 {len(EXTERNAL_ASSUMPTIONS_DF)} 筆歷史假設資料"
+                st.caption(EXTERNAL_ASSUMPTIONS_STATUS)
+        except Exception as hist_exc:
+            EXTERNAL_ASSUMPTIONS_DF = pd.DataFrame()
+            EXTERNAL_ASSUMPTIONS_STATUS = f"匯入失敗：{hist_exc}"
+            st.warning(EXTERNAL_ASSUMPTIONS_STATUS)
+    else:
+        EXTERNAL_ASSUMPTIONS_DF = pd.DataFrame()
+        EXTERNAL_ASSUMPTIONS_STATUS = "未匯入"
     fx_rate = sidebar_number_input("USD/TWD 匯率", min_value=20.0, max_value=50.0, value=float(saved.get("fx_rate", 32.0)), step=0.1, digits=1, help="把美元持股換算成台幣時使用。")
 
     csv_source = SAMPLE_CSV if SAMPLE_CSV.exists() else uploaded_csv
@@ -1181,6 +1323,34 @@ light_log = build_full_log(
     cur_res, rec_res, cus_res, validation_df, diagnostic_summary, []
 )
 light_log = sanitize_for_json(light_log)
+ai_validation_prompt_text = build_ai_validation_prompt(
+    scenario_name=scenario_name,
+    global_settings=global_settings,
+    validation_df=validation_df,
+    portfolio_effect_df=portfolio_effect_df,
+)
+light_bundle_zip_bytes = build_validation_bundle_zip(
+    bundle_kind="light",
+    settings_payload=settings_payload,
+    global_settings=global_settings,
+    scenario_row_dict=scenario_row.to_dict(),
+    diagnostic_summary=diagnostic_summary,
+    validation_df=validation_df,
+    portfolio_context_df=portfolio_context_df,
+    scenario_context_runtime_df=scenario_context_runtime_df,
+    portfolio_effect_df=portfolio_effect_df,
+    current_edited=current_edited,
+    recommended_edited=recommended_edited,
+    custom_edited=custom_edited,
+    current_norm=current_norm,
+    recommended_norm=recommended_norm,
+    custom_norm=custom_norm,
+    current_path_df=cur_res,
+    recommended_path_df=rec_res,
+    custom_path_df=cus_res,
+    scenario_table_df=pd.DataFrame(scenario_df),
+    light_log=light_log,
+)
 
 sims_df = pd.DataFrame()
 mc_metrics: Dict[str, Any] = {}
@@ -1341,44 +1511,33 @@ with main_tabs[4]:
         st.dataframe(format_table_df(portfolio_effect_df, pct_cols=["基礎加權報酬率%","基礎加權波動率%","AI 直接曝險權重%","market_return_shift_pct","weighted_ai_excess_shift_pct","scenario_shift_pct","effective_portfolio_return_pct","effective_portfolio_vol_pct"]), width="stretch", hide_index=True)
         audit_choice = st.selectbox("選擇要查看的假設組", ["Current", "Recommended", "Custom", "診斷摘要 / LOG"], key="audit_choice")
         audit_keep = ["ticker","name","classification_bucket","hist_10y_cagr_pct","hist_10y_source","model_return_pct","model_return_method","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct","model_vol_method","confidence","notes","updated_at"]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.download_button("一鍵下載 AI 驗證包 ZIP（輕量）", light_bundle_zip_bytes, f"ben_validation_bundle_light_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip", "application/zip", key="download_light_bundle_top")
+        c2.download_button("下載輕量 LOG（JSON）", prepare_json_download(light_log), "simulation_light_log.json", "application/json", key="download_light_log_top")
+        c3.download_button("下載診斷摘要（txt）", prepare_text_download(diagnostic_summary), "diagnostic_summary.txt", "text/plain", key="download_diag_top")
+        c4.download_button("下載 AI 驗證 Prompt", prepare_text_download(ai_validation_prompt_text), "AI_VALIDATION_PROMPT.txt", "text/plain", key="download_prompt_top")
 
         if audit_choice == "Current":
+            st.dataframe(format_table_df(build_assumption_coverage_df(current_norm, "Current"), pct_cols=["hist_10y 覆蓋率%","vol_3y 覆蓋率%","vol_5y 覆蓋率%"]), width="stretch", hide_index=True)
             st.dataframe(format_table_df(current_norm, pct_cols=["hist_10y_cagr_pct","model_return_pct","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct"], keep_cols=audit_keep), width="stretch", hide_index=True)
         elif audit_choice == "Recommended":
+            st.dataframe(format_table_df(build_assumption_coverage_df(recommended_norm, "Recommended"), pct_cols=["hist_10y 覆蓋率%","vol_3y 覆蓋率%","vol_5y 覆蓋率%"]), width="stretch", hide_index=True)
             st.dataframe(format_table_df(recommended_norm, pct_cols=["hist_10y_cagr_pct","model_return_pct","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct"], keep_cols=audit_keep), width="stretch", hide_index=True)
         elif audit_choice == "Custom":
+            st.dataframe(format_table_df(build_assumption_coverage_df(custom_norm, "Custom"), pct_cols=["hist_10y 覆蓋率%","vol_3y 覆蓋率%","vol_5y 覆蓋率%"]), width="stretch", hide_index=True)
             st.dataframe(format_table_df(custom_norm, pct_cols=["hist_10y_cagr_pct","model_return_pct","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct"], keep_cols=audit_keep), width="stretch", hide_index=True)
         else:
-            light_bundle_zip_bytes = build_validation_bundle_zip(
-                bundle_kind="light",
-                settings_payload=settings_payload,
-                global_settings=global_settings,
-                scenario_row_dict=scenario_row.to_dict(),
-                diagnostic_summary=diagnostic_summary,
-                validation_df=validation_df,
-                portfolio_context_df=portfolio_context_df,
-                scenario_context_runtime_df=scenario_context_runtime_df,
-                portfolio_effect_df=portfolio_effect_df,
-                current_edited=current_edited,
-                recommended_edited=recommended_edited,
-                custom_edited=custom_edited,
-                current_norm=current_norm,
-                recommended_norm=recommended_norm,
-                custom_norm=custom_norm,
-                current_path_df=cur_res,
-                recommended_path_df=rec_res,
-                custom_path_df=cus_res,
-                scenario_table_df=pd.DataFrame(scenario_df),
-                light_log=light_log,
-                sims_df=sims_df,
-                mc_summary_df=mc_summary_df,
-                mc_metrics=mc_metrics,
-                matrix_df=matrix_df,
-            )
-            d1, d2, d3 = st.columns(3)
+            all_cov = pd.concat([
+                build_assumption_coverage_df(current_norm, "Current"),
+                build_assumption_coverage_df(recommended_norm, "Recommended"),
+                build_assumption_coverage_df(custom_norm, "Custom"),
+            ], ignore_index=True)
+            st.dataframe(format_table_df(all_cov, pct_cols=["hist_10y 覆蓋率%","vol_3y 覆蓋率%","vol_5y 覆蓋率%"]), width="stretch", hide_index=True)
+            d1, d2, d3, d4 = st.columns(4)
             d1.download_button("下載輕量 LOG（JSON）", prepare_json_download(light_log), "simulation_light_log.json", "application/json")
             d2.download_button("下載診斷摘要（txt）", prepare_text_download(diagnostic_summary), "diagnostic_summary.txt", "text/plain")
             d3.download_button("一鍵下載 AI 驗證包 ZIP（輕量）", light_bundle_zip_bytes, f"ben_validation_bundle_light_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip", "application/zip")
+            d4.download_button("下載 AI 驗證 Prompt", prepare_text_download(ai_validation_prompt_text), "AI_VALIDATION_PROMPT.txt", "text/plain")
             st.text_area("可直接複製的診斷摘要", diagnostic_summary, height=380)
             st.caption("輕量包會一次打包：設定、情境、三組持股、年度路徑、validation、diagnostic summary、light log，以及已存在的 Monte Carlo 摘要。")
             if st.button("產生完整 LOG / AI 驗證包（較慢，含 Monte Carlo path replay）", key="gen_full_log_btn"):
@@ -1465,6 +1624,15 @@ with main_tabs[5]:
             st.success("目前最小檢查集皆通過。")
 
         st.dataframe(validation_df, width="stretch", hide_index=True)
+        if not fail_df.empty:
+            st.markdown("### FAIL 明細")
+            st.dataframe(fail_df, width="stretch", hide_index=True)
+        if not warn_df.empty:
+            st.markdown("### WARNING 明細")
+            st.dataframe(warn_df, width="stretch", hide_index=True)
+        dl1, dl2 = st.columns(2)
+        dl1.download_button("這裡也可下載 AI 驗證包 ZIP（輕量）", light_bundle_zip_bytes, f"ben_validation_bundle_light_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip", "application/zip", key="download_light_bundle_validation_tab")
+        dl2.download_button("下載 AI 驗證 Prompt", prepare_text_download(ai_validation_prompt_text), "AI_VALIDATION_PROMPT.txt", "text/plain", key="download_prompt_validation_tab")
 
         sens_rows = []
         for param, low, high, label in [
@@ -1482,7 +1650,10 @@ with main_tabs[5]:
 with main_tabs[6]:
 
     st.markdown("## 原始資料與下載")
-    st.info("若你要把整包資料丟給 AI 驗證，最省事的是到『5. 假設透明化 / LOG』直接按一鍵下載 AI 驗證包 ZIP。這裡則保留逐項下載。")
+    st.info(f"若你要把整包資料丟給 AI 驗證，最省事的是到『5. 假設透明化 / LOG』直接按一鍵下載 AI 驗證包 ZIP。這裡則保留逐項下載。歷史假設匯入狀態：{EXTERNAL_ASSUMPTIONS_STATUS}")
+    rt1, rt2 = st.columns(2)
+    rt1.download_button("下載 AI 驗證包 ZIP（輕量）", light_bundle_zip_bytes, f"ben_validation_bundle_light_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip", "application/zip", key="download_light_bundle_raw_tab")
+    rt2.download_button("下載 AI 驗證 Prompt", prepare_text_download(ai_validation_prompt_text), "AI_VALIDATION_PROMPT.txt", "text/plain", key="download_prompt_raw_tab")
     raw_tabs = st.tabs(["Current 正規化後", "Recommended 正規化後", "Custom 正規化後", "情境表", "Monte Carlo 明細"])
     with raw_tabs[0]:
         st.dataframe(format_table_df(current_norm, pct_cols=["weight_pct","hist_10y_cagr_pct","model_return_pct","vol_5y_weekly_pct","vol_3y_weekly_pct","model_vol_pct"], human_cols=["market_value_usd","cost_basis_usd","unrealized_gain_usd"]), width="stretch", hide_index=True)
