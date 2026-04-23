@@ -350,7 +350,74 @@ def normalize_weights(df: pd.DataFrame, weight_col: str = "weight_pct") -> pd.Da
         return df
     df.loc[included, weight_col] = df.loc[included, weight_col].clip(lower=0) / total * 100
     return df
+def apply_cash_reserve_target(df: pd.DataFrame, cash_target_pct: float, weight_col: str = "weight_pct") -> pd.DataFrame:
+    """
+    把組合調整成指定的現金保留比重。
+    - 若已有 Cash，直接調整 Cash 權重
+    - 其他資產按比例縮放
+    - 最後再正規化一次，確保總和為 100
+    """
+    df = df.copy()
 
+    if "include" not in df.columns:
+        df["include"] = True
+
+    included_mask = df["include"].fillna(True)
+    if included_mask.sum() == 0:
+        return df
+
+    # 先確保目前權重是乾淨的
+    df = normalize_weights(df, weight_col=weight_col)
+
+    # 找 Cash 列
+    cash_mask = included_mask & (
+        df.get("asset_class", "").astype(str).str.lower().eq("cash")
+        | df.get("ticker", "").astype(str).str.upper().eq("CASH")
+    )
+
+    # 如果沒有 Cash，就新增一列
+    if cash_mask.sum() == 0:
+        new_row = {col: None for col in df.columns}
+        new_row.update({
+            "ticker": "CASH",
+            "name": "Cash",
+            "asset_class": "Cash",
+            "theme": "Cash",
+            "role_bucket": "核心底盤",
+            "risk_group": "Cash",
+            "ai_direct": False,
+            "expected_return_pct": 0.0,
+            "volatility_pct": 0.0,
+            "sell_priority": 0,
+            "include": True,
+            weight_col: 0.0,
+        })
+        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+        included_mask = df["include"].fillna(True)
+        cash_mask = included_mask & (
+            df.get("asset_class", "").astype(str).str.lower().eq("cash")
+            | df.get("ticker", "").astype(str).str.upper().eq("CASH")
+        )
+
+    cash_target_pct = max(0.0, min(100.0, float(cash_target_pct)))
+
+    # 現金列設為目標比重
+    df.loc[cash_mask, weight_col] = cash_target_pct
+
+    # 其他列按比例縮放到剩餘比重
+    non_cash_mask = included_mask & (~cash_mask)
+    non_cash_total = df.loc[non_cash_mask, weight_col].clip(lower=0).sum()
+
+    remaining_pct = 100.0 - cash_target_pct
+    if non_cash_total > 0:
+        df.loc[non_cash_mask, weight_col] = (
+            df.loc[non_cash_mask, weight_col].clip(lower=0) / non_cash_total * remaining_pct
+        )
+    else:
+        # 如果其他資產全空，現金就吃滿
+        df.loc[cash_mask, weight_col] = 100.0
+
+    return normalize_weights(df, weight_col=weight_col)
 
 def portfolio_to_sim_input(df: pd.DataFrame, start_assets_twd: float) -> pd.DataFrame:
     work = df.copy()
