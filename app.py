@@ -73,8 +73,8 @@ EXTERNAL_ASSUMPTIONS_DF = pd.DataFrame()
 EXTERNAL_ASSUMPTIONS_STATUS = "未匯入"
 
 st.set_page_config(page_title="Ben 財務與投資模擬器", layout="wide")
-st.title("Ben 財務與投資模擬器 · 透明化驗算版 v7.8")
-st.caption("加入：Cash bucket 修正、組合加權報酬/波動、情境額外加成揭露、單一路徑與 Monte Carlo 明確分離、年度生效報酬 LOG、AI 驗證包 ZIP 一鍵下載、歷史假設資料匯入。")
+st.title("Ben 財務與投資模擬器 · v9 人生資產地圖版")
+st.caption("v9：在既有功能上新增人生資產地圖、現金流安全圖、Portfolio Lab 可視化、AI/半導體曝險儀表；避免重工，沿用既有輸入、模擬與驗證包。")
 
 st.markdown("""
 <style>
@@ -1300,6 +1300,8 @@ with main_tabs[0]:
 current_norm = prepare_simulation_df(apply_cash_reserve_target(normalize_weights(current_edited.copy()), cash_reserve_target_pct))
 recommended_norm = prepare_simulation_df(apply_cash_reserve_target(normalize_weights(recommended_edited.copy()), cash_reserve_target_pct))
 custom_norm = prepare_simulation_df(apply_cash_reserve_target(normalize_weights(custom_edited.copy()), cash_reserve_target_pct))
+candidate_norm = prepare_simulation_df(apply_cash_reserve_target(normalize_weights(build_candidate_portfolio()), cash_reserve_target_pct))
+voo_norm = prepare_simulation_df(apply_cash_reserve_target(normalize_weights(build_voo_benchmark_portfolio()), cash_reserve_target_pct))
 
 # 先做一輪基礎計算，讓 2~7 tab 都有內容可顯示。
 current_metrics = compute_risk_duplicate_metrics(current_norm)
@@ -1309,9 +1311,13 @@ scenario_row = get_scenario_row(pd.DataFrame(scenario_df), scenario_name)
 cur_res = simulate_portfolio(current_norm, scenario_row, simulation_years, start_assets_twd, CURRENT_AGE, CURRENT_YEAR, salary_annual, salary_growth_pct, retirement_age, tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, biz_projection_list, tuotuozu_fallback_mode, living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual, mortgage_annual, inheritance_age, inherited_rent_monthly, withdrawal_strategy, rebalance_frequency_years, mode_override_value, seed=42)
 rec_res = simulate_portfolio(recommended_norm, scenario_row, simulation_years, start_assets_twd, CURRENT_AGE, CURRENT_YEAR, salary_annual, salary_growth_pct, retirement_age, tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, biz_projection_list, tuotuozu_fallback_mode, living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual, mortgage_annual, inheritance_age, inherited_rent_monthly, withdrawal_strategy, rebalance_frequency_years, mode_override_value, seed=43)
 cus_res = simulate_portfolio(custom_norm, scenario_row, simulation_years, start_assets_twd, CURRENT_AGE, CURRENT_YEAR, salary_annual, salary_growth_pct, retirement_age, tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, biz_projection_list, tuotuozu_fallback_mode, living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual, mortgage_annual, inheritance_age, inherited_rent_monthly, withdrawal_strategy, rebalance_frequency_years, mode_override_value, seed=44)
+can_res = simulate_portfolio(candidate_norm, scenario_row, simulation_years, start_assets_twd, CURRENT_AGE, CURRENT_YEAR, salary_annual, salary_growth_pct, retirement_age, tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, biz_projection_list, tuotuozu_fallback_mode, living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual, mortgage_annual, inheritance_age, inherited_rent_monthly, withdrawal_strategy, rebalance_frequency_years, mode_override_value, seed=45)
+voo_res = simulate_portfolio(voo_norm, scenario_row, simulation_years, start_assets_twd, CURRENT_AGE, CURRENT_YEAR, salary_annual, salary_growth_pct, retirement_age, tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct, biz_projection_list, tuotuozu_fallback_mode, living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual, mortgage_annual, inheritance_age, inherited_rent_monthly, withdrawal_strategy, rebalance_frequency_years, mode_override_value, seed=46)
 cur_sum = summarize_simulation(cur_res, start_assets_twd)
 rec_sum = summarize_simulation(rec_res, start_assets_twd)
 cus_sum = summarize_simulation(cus_res, start_assets_twd)
+can_sum = summarize_simulation(can_res, start_assets_twd)
+voo_sum = summarize_simulation(voo_res, start_assets_twd)
 validation_df = build_validation_checks(
     current_edited, recommended_edited, custom_edited,
     rec_res, cur_res, cus_res, tuotuozu_mode, biz_projection_list, retirement_age, edu_phase2_annual, scenario_name
@@ -1808,8 +1814,131 @@ with main_tabs[7]:
         net_worth_twd=float(bs_metrics.get("net_worth_twd", 17_000_000.0) or 17_000_000.0),
     )
     st.dataframe(format_table_df(life_targets_df, human_cols=["total_assets_low_twd", "total_assets_high_twd", "net_worth_low_twd", "net_worth_high_twd"]), width="stretch", hide_index=True)
+    st.markdown("### G. v9 人生資產地圖")
+    st.caption("沿用既有模擬結果與人生階段目標，不重算一套新邏輯；這張圖用來觀察你目前路徑是否落在合理資產帶內。")
 
-    st.markdown("### G. 可視化開發重點")
+    def _path_for_life_map(label: str, path_df: pd.DataFrame) -> pd.DataFrame:
+        if path_df is None or path_df.empty:
+            return pd.DataFrame(columns=["portfolio", "age", "calendar_year", "liquid_assets_twd", "total_assets_twd", "net_worth_twd", "net_cashflow_twd"])
+        out = path_df[["age", "calendar_year", "end_assets_twd", "net_cashflow_twd", "total_income_twd", "total_expense_twd", "drawdown_pct"]].copy()
+        out["portfolio"] = label
+        out["liquid_assets_twd"] = out["end_assets_twd"]
+        out["total_assets_twd"] = out["end_assets_twd"] + float(home_value_input)
+        out["net_worth_twd"] = out["total_assets_twd"] - float(mortgage_input)
+        return out
+
+    life_paths_df = pd.concat([
+        _path_for_life_map("Current", cur_res),
+        _path_for_life_map("Recommended", rec_res),
+        _path_for_life_map("Custom", cus_res),
+        _path_for_life_map("Candidate", can_res),
+        _path_for_life_map("100% VOO", voo_res),
+    ], ignore_index=True)
+
+    fig_life = go.Figure()
+    if not life_targets_df.empty:
+        target_sorted = life_targets_df.sort_values("age")
+        fig_life.add_trace(go.Scatter(
+            x=target_sorted["age"],
+            y=target_sorted["total_assets_high_twd"],
+            line=dict(width=0),
+            showlegend=False,
+            hoverinfo="skip",
+        ))
+        fig_life.add_trace(go.Scatter(
+            x=target_sorted["age"],
+            y=target_sorted["total_assets_low_twd"],
+            fill="tonexty",
+            name="合理總資產區間",
+            line=dict(width=0),
+            fillcolor="rgba(80, 200, 120, 0.18)",
+        ))
+    if not life_paths_df.empty:
+        for label in ["Current", "Candidate", "100% VOO", "Recommended", "Custom"]:
+            sub = life_paths_df.loc[life_paths_df["portfolio"].eq(label)]
+            if not sub.empty:
+                fig_life.add_trace(go.Scatter(
+                    x=sub["age"],
+                    y=sub["total_assets_twd"],
+                    mode="lines+markers",
+                    name=f"{label} 總資產",
+                ))
+    fig_life.update_layout(
+        title="人生資產地圖：總資產路徑 vs 合理目標區間",
+        xaxis_title="年齡",
+        yaxis_title="TWD",
+        hovermode="x unified",
+        height=520,
+    )
+    st.plotly_chart(fig_life, width="stretch")
+
+    fig_net = px.line(
+        life_paths_df,
+        x="age",
+        y="net_worth_twd",
+        color="portfolio",
+        markers=True,
+        title="淨資產路徑：總資產扣除房貸後的真實安全度",
+    ) if not life_paths_df.empty else go.Figure()
+    st.plotly_chart(fig_net, width="stretch")
+
+    st.markdown("### H. 現金流安全圖")
+    st.caption("這張圖回答：哪一年會因妥妥租、生活費、教育費或市場下跌而需要賣資產？紅線以下要特別注意。")
+    cashflow_plot_df = life_paths_df.copy()
+    if not cashflow_plot_df.empty:
+        fig_cash = px.line(
+            cashflow_plot_df,
+            x="calendar_year",
+            y="net_cashflow_twd",
+            color="portfolio",
+            markers=True,
+            title="年度淨現金流：收入 - 生活費 - 教育費 - 房貸利息",
+        )
+        fig_cash.add_hline(y=0, line_dash="dash", line_color="red", annotation_text="現金流平衡線")
+        fig_cash.add_vrect(x0=2034 - 0.5, x1=2038 + 0.5, fillcolor="orange", opacity=0.10, line_width=0, annotation_text="教育費高峰")
+        st.plotly_chart(fig_cash, width="stretch")
+        neg_years = cashflow_plot_df.loc[cashflow_plot_df["net_cashflow_twd"] < 0, ["portfolio", "calendar_year", "net_cashflow_twd"]]
+        if not neg_years.empty:
+            st.warning("以下年份出現負現金流，未來要檢查是否由現金支付、降低 DCA，或被迫賣出資產。")
+            st.dataframe(format_table_df(neg_years, human_cols=["net_cashflow_twd"]), width="stretch", hide_index=True)
+        else:
+            st.success("目前單一路徑下未出現年度負現金流；仍建議用 Monte Carlo 檢查 P5 worst case。")
+
+    st.markdown("### I. Portfolio Lab：Current / Candidate / 100% VOO")
+    st.caption("這一區專門回答：主動選股是否真的比大盤更適合 Ben，而不是只看報酬率高低。")
+    portfolio_lab_df = pd.DataFrame([
+        {"portfolio": "Current", "ending_assets_twd": cur_sum.get("最終資產終值"), "max_drawdown_pct": cur_sum.get("最大回撤 %"), "ten_year_assets_twd": cur_sum.get("10 年後淨資產"), "life_fit_score": cur_sum.get("人生適配分數")},
+        {"portfolio": "Recommended", "ending_assets_twd": rec_sum.get("最終資產終值"), "max_drawdown_pct": rec_sum.get("最大回撤 %"), "ten_year_assets_twd": rec_sum.get("10 年後淨資產"), "life_fit_score": rec_sum.get("人生適配分數")},
+        {"portfolio": "Custom", "ending_assets_twd": cus_sum.get("最終資產終值"), "max_drawdown_pct": cus_sum.get("最大回撤 %"), "ten_year_assets_twd": cus_sum.get("10 年後淨資產"), "life_fit_score": cus_sum.get("人生適配分數")},
+        {"portfolio": "Candidate", "ending_assets_twd": can_sum.get("最終資產終值"), "max_drawdown_pct": can_sum.get("最大回撤 %"), "ten_year_assets_twd": can_sum.get("10 年後淨資產"), "life_fit_score": can_sum.get("人生適配分數")},
+        {"portfolio": "100% VOO", "ending_assets_twd": voo_sum.get("最終資產終值"), "max_drawdown_pct": voo_sum.get("最大回撤 %"), "ten_year_assets_twd": voo_sum.get("10 年後淨資產"), "life_fit_score": voo_sum.get("人生適配分數")},
+    ])
+    st.dataframe(format_table_df(portfolio_lab_df, pct_cols=["max_drawdown_pct"], human_cols=["ending_assets_twd", "ten_year_assets_twd"]), width="stretch", hide_index=True)
+    lab_cols = st.columns(2)
+    lab_cols[0].plotly_chart(px.bar(portfolio_lab_df, x="portfolio", y="ending_assets_twd", title="單一路徑終值比較"), width="stretch")
+    lab_cols[1].plotly_chart(px.bar(portfolio_lab_df, x="portfolio", y="max_drawdown_pct", title="最大回撤比較（越接近 0 越舒服）"), width="stretch")
+
+    st.markdown("### J. AI / 半導體曝險儀表")
+    us_investment_twd = float(current_edited.get("market_value_usd", pd.Series(dtype=float)).sum() * fx_rate) if "market_value_usd" in current_edited.columns else 0.0
+    tw_investment_twd = float(tw_stock_df["market_value_twd"].sum()) if not tw_stock_df.empty and "market_value_twd" in tw_stock_df.columns else 0.0
+    us_ai_pct = float(current_metrics.get("直接 AI 曝險 %", 0.0) or 0.0)
+    us_ai_twd = us_investment_twd * us_ai_pct / 100.0
+    tw_ai_twd = float(tw_stock_df.loc[tw_stock_df["ai_direct"], "market_value_twd"].sum()) if not tw_stock_df.empty and "ai_direct" in tw_stock_df.columns else 0.0
+    total_stock_investment = max(us_investment_twd + tw_investment_twd, 1.0)
+    combined_ai_pct = (us_ai_twd + tw_ai_twd) / total_stock_investment * 100.0
+    ai_cols = st.columns(4)
+    ai_cols[0].metric("美股 AI 曝險", fmt_pct(us_ai_pct, 1))
+    ai_cols[1].metric("台股 AI/半導體", fmt_human(tw_ai_twd, 1))
+    ai_cols[2].metric("合併 AI 曝險", fmt_pct(combined_ai_pct, 1))
+    ai_cols[3].metric("股票投資合計", fmt_human(total_stock_investment, 1))
+    ai_pie_df = pd.DataFrame([
+        {"bucket": "US AI direct", "amount_twd": us_ai_twd},
+        {"bucket": "TW AI / Semi", "amount_twd": tw_ai_twd},
+        {"bucket": "Other stocks", "amount_twd": max(total_stock_investment - us_ai_twd - tw_ai_twd, 0.0)},
+    ])
+    st.plotly_chart(px.pie(ai_pie_df, names="bucket", values="amount_twd", title="美股 + 台股合併 AI / 半導體曝險"), width="stretch")
+
+    st.markdown("### K. 可視化開發重點")
     st.markdown("""
 - **個人財務追蹤**：Moneybook 帳戶、台股、現金、房貸、房產、市值變化。
 - **現金流驗證**：妥妥租預測表、租金、薪資、生活費、教育費高峰。
