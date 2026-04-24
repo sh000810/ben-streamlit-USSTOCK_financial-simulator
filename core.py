@@ -1966,3 +1966,339 @@ def run_monte_carlo_compare(
     if "current_beats_custom" in sims.columns:
         metrics["Current 勝過 Custom 機率"] = float(sims["current_beats_custom"].mean() * 100.0)
     return sims, metrics
+
+# ===== v11.2 hotfix: restore UI helper functions required by v9/v10 app.py =====
+# These helpers are intentionally lightweight and backward-compatible. They restore
+# symbols imported by the Streamlit UI after the calibrated risk-engine patch.
+
+CANDIDATE_WEIGHTS = {
+    "CASH": 14.0,
+    "VOO": 25.0,
+    "BRK.B": 15.0,
+    "NVDA": 7.0,
+    "MSFT": 7.0,
+    "GOOG": 5.0,
+    "AMZN": 5.0,
+    "ASML": 5.0,
+    "AVGO": 3.0,
+    "ANET": 3.0,
+    "NOW": 3.0,
+    "EQIX": 2.0,
+    "MA": 2.0,
+    "ETN": 2.0,
+    "LMT": 1.0,
+    "BTI": 1.0,
+}
+
+
+def _canonical_ticker_for_ui(ticker: object) -> str:
+    t = str(ticker or "").strip().upper()
+    mapping = {
+        "CASH & CASH INVESTMENTS": "CASH",
+        "CASH": "CASH",
+        "BRK/B": "BRK.B",
+        "GOOGL": "GOOG",
+    }
+    return mapping.get(t, t)
+
+
+def _portfolio_from_weights(weights: Dict[str, float], name_prefix: str = "") -> pd.DataFrame:
+    rows = []
+    for ticker, weight in weights.items():
+        canon = _canonical_ticker_for_ui(ticker)
+        cls_key = "Cash" if canon == "CASH" else canon
+        cls = classify_ticker(cls_key, "Cash" if canon == "CASH" else "")
+        rows.append({
+            "ticker": canon,
+            "name": f"{name_prefix}{canon}" if name_prefix else canon,
+            "weight_pct": float(weight),
+            "asset_class": cls.get("asset_class", "Equity"),
+            "theme": cls.get("theme", "Other"),
+            "role_bucket": cls.get("role_bucket", "其他"),
+            "risk_group": cls.get("risk_group", "other"),
+            "ai_direct": bool(cls.get("ai_direct", False)),
+            "expected_return_pct": float(cls.get("expected_return_pct", 8.0)),
+            "volatility_pct": float(cls.get("volatility_pct", 24.0)),
+            "sell_priority": int(cls.get("sell_priority", 4)),
+            "include": True,
+        })
+    return normalize_weights(pd.DataFrame(rows))
+
+
+def build_candidate_portfolio() -> pd.DataFrame:
+    """Ben balanced growth-defense candidate portfolio used by Portfolio Lab."""
+    return _portfolio_from_weights(CANDIDATE_WEIGHTS)
+
+
+def build_voo_benchmark_portfolio() -> pd.DataFrame:
+    """Simple 100% VOO benchmark portfolio."""
+    return _portfolio_from_weights({"VOO": 100.0})
+
+
+def _find_col_by_keywords(columns: Iterable[str], keyword_groups: List[List[str]]) -> Optional[str]:
+    cols = list(columns)
+    lowered = {c: str(c).strip().lower() for c in cols}
+    for group in keyword_groups:
+        for c, low in lowered.items():
+            if any(str(k).lower() in low for k in group):
+                return c
+    return None
+
+
+def _read_table_auto(source: BytesIO | StringIO | str | Path) -> pd.DataFrame:
+    if source is None:
+        return pd.DataFrame()
+    # Try utf-8-sig first, then common Traditional Chinese encodings.
+    if isinstance(source, (str, Path)):
+        path = str(source)
+        if path.lower().endswith(('.xlsx', '.xls')):
+            return pd.read_excel(path)
+        for enc in ("utf-8-sig", "utf-8", "big5", "cp950"):
+            try:
+                return pd.read_csv(path, encoding=enc)
+            except Exception:
+                continue
+        return pd.read_csv(path)
+    else:
+        try:
+            pos = source.tell()
+        except Exception:
+            pos = None
+        for enc in ("utf-8-sig", "utf-8", "big5", "cp950"):
+            try:
+                if pos is not None:
+                    source.seek(0)
+                return pd.read_csv(source, encoding=enc)
+            except Exception:
+                continue
+        if pos is not None:
+            source.seek(0)
+        return pd.read_csv(source)
+
+
+def load_tw_stock_positions(source: BytesIO | StringIO | str | Path) -> pd.DataFrame:
+    """Load Moneybook 台股證券手動新增庫存 CSV into portfolio-like rows."""
+    try:
+        df = _read_table_auto(source)
+    except Exception:
+        return pd.DataFrame(columns=["ticker", "name", "quantity", "market_value_twd", "cost_basis_twd"])
+    if df.empty:
+        return pd.DataFrame(columns=["ticker", "name", "quantity", "market_value_twd", "cost_basis_twd"])
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    ticker_col = _find_col_by_keywords(df.columns, [["代號"], ["ticker"], ["symbol"], ["股票代碼"]])
+    name_col = _find_col_by_keywords(df.columns, [["名稱"], ["股票名稱"], ["name"]])
+    qty_col = _find_col_by_keywords(df.columns, [["股數"], ["庫存"], ["quantity"], ["qty"]])
+    mv_col = _find_col_by_keywords(df.columns, [["市值"], ["market value"], ["market_value"], ["現值"]])
+    cost_col = _find_col_by_keywords(df.columns, [["成本"], ["cost"], ["投入"]])
+
+    out = pd.DataFrame()
+    out["ticker"] = df[ticker_col].fillna("").astype(str).str.strip() if ticker_col else ""
+    out["name"] = df[name_col].fillna("").astype(str).str.strip() if name_col else out["ticker"]
+    out["quantity"] = df[qty_col].map(_clean_numeric) if qty_col else 0.0
+    out["market_value_twd"] = df[mv_col].map(_clean_numeric) if mv_col else 0.0
+    out["cost_basis_twd"] = df[cost_col].map(_clean_numeric) if cost_col else 0.0
+    out = out[out["ticker"].astype(str).str.strip().ne("")].copy()
+
+    # Normalize well-known Taiwan tickers for portfolio risk grouping.
+    def tw_classify(t: str) -> Dict[str, object]:
+        t = str(t).strip()
+        if t == "2330":
+            return {"asset_class":"TW Equity", "theme":"Taiwan Semi / AI Supply Chain", "role_bucket":"半導體核心", "risk_group":"semi", "ai_direct":True, "expected_return_pct":8.5, "volatility_pct":26.0, "sell_priority":4}
+        if t == "0050":
+            return {"asset_class":"TW ETF", "theme":"Taiwan Core ETF", "role_bucket":"台股核心底盤", "risk_group":"market_core", "ai_direct":False, "expected_return_pct":7.0, "volatility_pct":20.0, "sell_priority":2}
+        if t == "6752":
+            return {"asset_class":"TW Equity", "theme":"Taiwan Software", "role_bucket":"台股軟體衛星", "risk_group":"software", "ai_direct":False, "expected_return_pct":7.0, "volatility_pct":28.0, "sell_priority":4}
+        return {"asset_class":"TW Equity", "theme":"Taiwan Equity", "role_bucket":"台股其他", "risk_group":"other", "ai_direct":False, "expected_return_pct":7.0, "volatility_pct":24.0, "sell_priority":4}
+
+    cls = out["ticker"].apply(tw_classify).apply(pd.Series)
+    out = pd.concat([out.reset_index(drop=True), cls.reset_index(drop=True)], axis=1)
+    total = float(out["market_value_twd"].sum())
+    out["weight_pct"] = np.where(total > 0, out["market_value_twd"] / total * 100.0, 0.0)
+    out["include"] = True
+    return out.reset_index(drop=True)
+
+
+def load_moneybook_accounts(source: BytesIO | StringIO | str | Path) -> pd.DataFrame:
+    """Load Moneybook accounts CSV and classify cash/liabilities roughly."""
+    try:
+        df = _read_table_auto(source)
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    amount_col = _find_col_by_keywords(df.columns, [["帳戶金額"], ["balance"], ["amount"], ["金額"]])
+    currency_col = _find_col_by_keywords(df.columns, [["幣別"], ["currency"]])
+    account_col = _find_col_by_keywords(df.columns, [["帳戶名稱"], ["account"], ["名稱"]])
+    inst_col = _find_col_by_keywords(df.columns, [["機構名稱"], ["institution"], ["銀行"]])
+    out = df.copy()
+    out["account_name"] = out[account_col].fillna("").astype(str) if account_col else ""
+    out["institution"] = out[inst_col].fillna("").astype(str) if inst_col else ""
+    out["currency"] = out[currency_col].fillna("TWD").astype(str).str.upper() if currency_col else "TWD"
+    out["amount_raw"] = out[amount_col].map(_clean_numeric) if amount_col else 0.0
+
+    def fx_to_twd(row):
+        # Keep simple; UI can override later. Most Moneybook account exports in this project are TWD.
+        cur = str(row.get("currency", "TWD")).upper()
+        val = float(row.get("amount_raw", 0.0) or 0.0)
+        if cur in {"USD", "US$"}:
+            return val * 32.0
+        return val
+    out["amount_twd"] = out.apply(fx_to_twd, axis=1)
+
+    def cat(row):
+        text = f"{row.get('account_name','')} {row.get('institution','')}".lower()
+        amt = float(row.get("amount_twd", 0.0) or 0.0)
+        if "信用" in text or "card" in text:
+            return "credit_card"
+        if "房貸" in text or "貸款" in text or "mortgage" in text or amt < 0:
+            return "other_liability"
+        if "證券" in text or "股票" in text or "stock" in text:
+            return "investment_account"
+        return "cash"
+    out["category"] = out.apply(cat, axis=1)
+    return out
+
+
+def build_personal_balance_sheet(
+    moneybook_accounts: Optional[pd.DataFrame] = None,
+    tw_stock_positions: Optional[pd.DataFrame] = None,
+    us_stock_value_twd: float = 0.0,
+    real_estate_value_twd: float = 8_500_000.0,
+    mortgage_balance_twd: float = -9_000_000.0,
+    cash_floor_twd: float = 1_500_000.0,
+) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    rows: List[Dict[str, object]] = []
+    accounts = moneybook_accounts if moneybook_accounts is not None else pd.DataFrame()
+    cash = float(accounts.loc[accounts.get("category", pd.Series(dtype=str)).eq("cash"), "amount_twd"].sum()) if not accounts.empty and "amount_twd" in accounts.columns else 0.0
+    credit_card = float(accounts.loc[accounts.get("category", pd.Series(dtype=str)).eq("credit_card"), "amount_twd"].sum()) if not accounts.empty and "amount_twd" in accounts.columns else 0.0
+    other_liab = float(accounts.loc[accounts.get("category", pd.Series(dtype=str)).eq("other_liability"), "amount_twd"].sum()) if not accounts.empty and "amount_twd" in accounts.columns else 0.0
+    tw_stock = float(tw_stock_positions["market_value_twd"].sum()) if tw_stock_positions is not None and not tw_stock_positions.empty and "market_value_twd" in tw_stock_positions.columns else 0.0
+    def add(category, label, amount, source):
+        rows.append({"category": category, "label": label, "amount_twd": float(amount or 0.0), "source": source})
+    add("cash", "現金/活存/外幣現金", cash, "Moneybook 帳戶")
+    add("credit_card", "信用卡負債", credit_card, "Moneybook 帳戶")
+    add("other_liability", "其他負債", other_liab, "Moneybook 帳戶")
+    add("us_stock", "美股資產", us_stock_value_twd, "Broker CSV / 手動輸入")
+    add("tw_stock", "台股資產", tw_stock, "Moneybook 台股庫存")
+    add("real_estate_override", "房產市值（手動口徑）", real_estate_value_twd, "手動輸入")
+    add("mortgage_override", "房貸（手動口徑）", mortgage_balance_twd, "手動輸入")
+    bs = pd.DataFrame(rows)
+    total_assets = float(bs.loc[bs["amount_twd"] > 0, "amount_twd"].sum())
+    total_liabilities = float(bs.loc[bs["amount_twd"] < 0, "amount_twd"].sum())
+    liquid_assets = cash + us_stock_value_twd + tw_stock
+    net_worth = total_assets + total_liabilities
+    investable_cash = max(0.0, cash - cash_floor_twd)
+    leverage = total_assets / max(net_worth, 1.0)
+    metrics = {
+        "total_assets_twd": total_assets,
+        "total_liabilities_twd": total_liabilities,
+        "net_worth_twd": net_worth,
+        "liquid_assets_twd": liquid_assets,
+        "cash_twd": cash,
+        "investable_cash_twd": investable_cash,
+        "leverage_ratio": leverage,
+    }
+    return bs, metrics
+
+
+def clean_moneybook_transactions(source: BytesIO | StringIO | str | Path | pd.DataFrame) -> pd.DataFrame:
+    """Initial rule-based Moneybook transaction cleaner for personal spending calibration."""
+    try:
+        df = source.copy() if isinstance(source, pd.DataFrame) else _read_table_auto(source)
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    date_col = _find_col_by_keywords(df.columns, [["日期"], ["date"], ["時間"]])
+    amount_col = _find_col_by_keywords(df.columns, [["金額"], ["amount"]])
+    desc_col = _find_col_by_keywords(df.columns, [["備註"], ["說明"], ["description"], ["memo"], ["名稱"], ["分類"]])
+    cat_col = _find_col_by_keywords(df.columns, [["分類"], ["category"]])
+    out = df.copy()
+    out["date"] = pd.to_datetime(out[date_col], errors="coerce") if date_col else pd.NaT
+    out["amount_twd"] = out[amount_col].map(_clean_numeric) if amount_col else 0.0
+    out["description"] = out[desc_col].fillna("").astype(str) if desc_col else ""
+    out["category_raw"] = out[cat_col].fillna("").astype(str) if cat_col else ""
+    text = (out["description"] + " " + out["category_raw"]).astype(str)
+    transfer_kw = "轉帳|信用卡費|繳卡費|還款|跨行|提領|存入|投資|買股|證券|入金|出金"
+    business_kw = "妥妥租|QLAB|學問|公司|租客|屋主|修繕|代墊|發票|課程"
+    out["is_transfer_like"] = text.str.contains(transfer_kw, case=False, regex=True, na=False)
+    out["is_business_like"] = text.str.contains(business_kw, case=False, regex=True, na=False)
+    # Spending is normally negative in many exports; keep absolute value for expense analysis.
+    out["personal_expense_twd"] = np.where((out["amount_twd"] < 0) & ~out["is_transfer_like"] & ~out["is_business_like"], -out["amount_twd"], 0.0)
+    out["month"] = out["date"].dt.to_period("M").astype(str)
+    return out
+
+
+def summarize_monthly_spending(cleaned_transactions: pd.DataFrame) -> pd.DataFrame:
+    if cleaned_transactions is None or cleaned_transactions.empty:
+        return pd.DataFrame(columns=["month", "personal_expense_twd"])
+    work = cleaned_transactions.copy()
+    if "month" not in work.columns:
+        if "date" in work.columns:
+            work["month"] = pd.to_datetime(work["date"], errors="coerce").dt.to_period("M").astype(str)
+        else:
+            work["month"] = "unknown"
+    if "personal_expense_twd" not in work.columns:
+        work["personal_expense_twd"] = 0.0
+    return work.groupby("month", as_index=False)["personal_expense_twd"].sum().sort_values("month").reset_index(drop=True)
+
+
+def build_dynamic_dca_plan(
+    monthly_income_twd: float,
+    monthly_expense_twd: float,
+    current_cash_twd: float,
+    cash_floor_twd: float = 1_500_000.0,
+    max_dca_ratio: float = 0.80,
+) -> pd.DataFrame:
+    surplus = max(0.0, float(monthly_income_twd) - float(monthly_expense_twd))
+    excess_cash = max(0.0, float(current_cash_twd) - float(cash_floor_twd))
+    conservative = min(100_000.0, surplus * 0.5) if surplus > 0 else 0.0
+    recommended = min(surplus * max_dca_ratio, surplus * 0.8 + excess_cash / 24.0)
+    aggressive = min(surplus + excess_cash / 12.0, surplus * 1.0 + excess_cash / 12.0)
+    return pd.DataFrame([
+        {"mode":"保守", "monthly_dca_twd": round(conservative), "note":"先維持基本投入，保留更大現金緩衝"},
+        {"mode":"建議", "monthly_dca_twd": round(recommended), "note":"以可投資剩餘現金流的 80% 投入，保留機動緩衝"},
+        {"mode":"積極", "monthly_dca_twd": round(aggressive), "note":"現金水位充足且收入穩定時使用，不建議長期無腦滿檔"},
+    ])
+
+
+def build_life_stage_targets() -> pd.DataFrame:
+    return pd.DataFrame([
+        {"age":45, "year":2027, "total_assets_low_twd":28_000_000, "total_assets_high_twd":35_000_000, "net_worth_low_twd":19_000_000, "net_worth_high_twd":26_000_000, "focus":"資料清理、現金水位、DCA 規則"},
+        {"age":50, "year":2032, "total_assets_low_twd":45_000_000, "total_assets_high_twd":60_000_000, "net_worth_low_twd":35_000_000, "net_worth_high_twd":50_000_000, "focus":"第一個財務自由檢查點"},
+        {"age":55, "year":2037, "total_assets_low_twd":60_000_000, "total_assets_high_twd":90_000_000, "net_worth_low_twd":50_000_000, "net_worth_high_twd":80_000_000, "focus":"半退休/降低工作依賴檢查點"},
+        {"age":60, "year":2042, "total_assets_low_twd":80_000_000, "total_assets_high_twd":120_000_000, "net_worth_low_twd":70_000_000, "net_worth_high_twd":110_000_000, "focus":"資產防守轉換期"},
+        {"age":65, "year":2047, "total_assets_low_twd":100_000_000, "total_assets_high_twd":160_000_000, "net_worth_low_twd":90_000_000, "net_worth_high_twd":150_000_000, "focus":"高度財務自由與傳承規劃"},
+    ])
+
+
+def combine_us_tw_current_portfolio(us_df: pd.DataFrame, tw_df: pd.DataFrame, cash_twd: float = 0.0, fx_rate: float = 32.0) -> pd.DataFrame:
+    """Optional helper: combine US broker holdings, TW stocks, and cash into one normalized portfolio."""
+    rows = []
+    if us_df is not None and not us_df.empty:
+        for _, r in us_df.iterrows():
+            val = float(r.get("market_value_usd", 0.0) or 0.0) * fx_rate if "market_value_usd" in us_df.columns else float(r.get("value_twd", 0.0) or 0.0)
+            rows.append({**r.to_dict(), "value_twd": val})
+    if tw_df is not None and not tw_df.empty:
+        for _, r in tw_df.iterrows():
+            rows.append({**r.to_dict(), "value_twd": float(r.get("market_value_twd", 0.0) or 0.0)})
+    if cash_twd and cash_twd > 0:
+        cls = classify_ticker("Cash", "Cash")
+        rows.append({"ticker":"CASH", "name":"Cash", "value_twd":float(cash_twd), "asset_class":"Cash", "theme":"Cash", "role_bucket":"安全墊", "risk_group":"cash", "ai_direct":False, "expected_return_pct":1.5, "volatility_pct":0.0, "sell_priority":0, "include":True})
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    if "include" not in out.columns:
+        out["include"] = True
+    total = float(pd.to_numeric(out.get("value_twd", 0), errors="coerce").fillna(0).sum())
+    out["weight_pct"] = np.where(total > 0, pd.to_numeric(out["value_twd"], errors="coerce").fillna(0) / total * 100.0, 0.0)
+    # Ensure expected fields exist
+    for col, default in {"ticker":"", "name":"", "asset_class":"Equity", "theme":"Other", "role_bucket":"其他", "risk_group":"other", "ai_direct":False, "expected_return_pct":8.0, "volatility_pct":24.0, "sell_priority":4}.items():
+        if col not in out.columns:
+            out[col] = default
+    return out.reset_index(drop=True)
