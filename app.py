@@ -73,8 +73,8 @@ EXTERNAL_ASSUMPTIONS_DF = pd.DataFrame()
 EXTERNAL_ASSUMPTIONS_STATUS = "未匯入"
 
 st.set_page_config(page_title="Ben 財務與投資模擬器", layout="wide")
-st.title("Ben 財務與投資模擬器 · v9 人生資產地圖版")
-st.caption("v9：在既有功能上新增人生資產地圖、現金流安全圖、Portfolio Lab 可視化、AI/半導體曝險儀表；避免重工，沿用既有輸入、模擬與驗證包。")
+st.title("Ben 財務與投資模擬器 · v10 股票配置決策版")
+st.caption("v10：在 v9 人生資產地圖基礎上，新增 Ben 人生勝率分數、Current→Candidate 交換代價表、目標覆蓋率與 AI/半導體集中度決策儀表。")
 
 st.markdown("""
 <style>
@@ -1904,19 +1904,151 @@ with main_tabs[7]:
         else:
             st.success("目前單一路徑下未出現年度負現金流；仍建議用 Monte Carlo 檢查 P5 worst case。")
 
-    st.markdown("### I. Portfolio Lab：Current / Candidate / 100% VOO")
-    st.caption("這一區專門回答：主動選股是否真的比大盤更適合 Ben，而不是只看報酬率高低。")
-    portfolio_lab_df = pd.DataFrame([
-        {"portfolio": "Current", "ending_assets_twd": cur_sum.get("最終資產終值"), "max_drawdown_pct": cur_sum.get("最大回撤 %"), "ten_year_assets_twd": cur_sum.get("10 年後淨資產"), "life_fit_score": cur_sum.get("人生適配分數")},
-        {"portfolio": "Recommended", "ending_assets_twd": rec_sum.get("最終資產終值"), "max_drawdown_pct": rec_sum.get("最大回撤 %"), "ten_year_assets_twd": rec_sum.get("10 年後淨資產"), "life_fit_score": rec_sum.get("人生適配分數")},
-        {"portfolio": "Custom", "ending_assets_twd": cus_sum.get("最終資產終值"), "max_drawdown_pct": cus_sum.get("最大回撤 %"), "ten_year_assets_twd": cus_sum.get("10 年後淨資產"), "life_fit_score": cus_sum.get("人生適配分數")},
-        {"portfolio": "Candidate", "ending_assets_twd": can_sum.get("最終資產終值"), "max_drawdown_pct": can_sum.get("最大回撤 %"), "ten_year_assets_twd": can_sum.get("10 年後淨資產"), "life_fit_score": can_sum.get("人生適配分數")},
-        {"portfolio": "100% VOO", "ending_assets_twd": voo_sum.get("最終資產終值"), "max_drawdown_pct": voo_sum.get("最大回撤 %"), "ten_year_assets_twd": voo_sum.get("10 年後淨資產"), "life_fit_score": voo_sum.get("人生適配分數")},
-    ])
-    st.dataframe(format_table_df(portfolio_lab_df, pct_cols=["max_drawdown_pct"], human_cols=["ending_assets_twd", "ten_year_assets_twd"]), width="stretch", hide_index=True)
+    st.markdown("### I. v10 股票配置決策儀表板")
+    st.caption("這一區不再只問『誰終值最高』，而是回答：Current 多出來的上檔，是否值得承擔多出來的集中與回撤風險。")
+
+    def _safe_float(value, default=0.0):
+        try:
+            if pd.isna(value):
+                return default
+            return float(value)
+        except Exception:
+            return default
+
+    def _safe_drawdown(value):
+        # 最大回撤理論上不應為正；若舊版模型算出正值，先壓回 0，避免誤導。
+        return min(0.0, _safe_float(value, 0.0))
+
+    def _portfolio_ai_exposure_pct(label: str, portfolio_df: pd.DataFrame) -> float:
+        metrics = compute_risk_duplicate_metrics(portfolio_df) if portfolio_df is not None and not portfolio_df.empty else {}
+        us_ai_pct_local = _safe_float(metrics.get("直接 AI 曝險 %"), 0.0)
+        # Current 要把台股台積電/半導體曝險合併看；其他方案先以該方案本身曝險呈現。
+        if label == "Current":
+            us_mv_twd = float(current_edited.get("market_value_usd", pd.Series(dtype=float)).sum() * fx_rate) if "market_value_usd" in current_edited.columns else 0.0
+            tw_mv_twd = float(tw_stock_df["market_value_twd"].sum()) if not tw_stock_df.empty and "market_value_twd" in tw_stock_df.columns else 0.0
+            tw_ai_local = float(tw_stock_df.loc[tw_stock_df["ai_direct"], "market_value_twd"].sum()) if not tw_stock_df.empty and "ai_direct" in tw_stock_df.columns else 0.0
+            denom = max(us_mv_twd + tw_mv_twd, 1.0)
+            return (us_mv_twd * us_ai_pct_local / 100.0 + tw_ai_local) / denom * 100.0
+        return us_ai_pct_local
+
+    summary_map = {
+        "Current": (cur_sum, cur_res, current_norm),
+        "Recommended": (rec_sum, rec_res, recommended_norm),
+        "Custom": (cus_sum, cus_res, custom_norm),
+        "Candidate": (can_sum, can_res, candidate_norm),
+        "100% VOO": (voo_sum, voo_res, voo_norm),
+    }
+
+    decision_rows = []
+    for label, (summary, path, port_df) in summary_map.items():
+        neg_cashflow_years = int((path["net_cashflow_twd"] < 0).sum()) if path is not None and not path.empty and "net_cashflow_twd" in path.columns else 0
+        ai_pct_local = _portfolio_ai_exposure_pct(label, port_df)
+        metrics_local = compute_risk_duplicate_metrics(port_df) if port_df is not None and not port_df.empty else {}
+        single_name_pct = _safe_float(metrics_local.get("單一持股過重程度（最大權重%）"), 0.0)
+        decision_rows.append({
+            "portfolio": label,
+            "ending_assets_twd": _safe_float(summary.get("最終資產終值")),
+            "ten_year_assets_twd": _safe_float(summary.get("10 年後淨資產")),
+            "max_drawdown_pct": _safe_drawdown(summary.get("最大回撤 %")),
+            "negative_cashflow_years": neg_cashflow_years,
+            "ai_semi_exposure_pct": ai_pct_local,
+            "single_name_max_pct": single_name_pct,
+            "life_fit_score_old": _safe_float(summary.get("人生適配分數")),
+        })
+
+    portfolio_lab_df = pd.DataFrame(decision_rows)
+    max_ending = max(float(portfolio_lab_df["ending_assets_twd"].max()), 1.0)
+    max_ten = max(float(portfolio_lab_df["ten_year_assets_twd"].max()), 1.0)
+    portfolio_lab_df["growth_score"] = portfolio_lab_df["ending_assets_twd"] / max_ending * 100.0
+    portfolio_lab_df["ten_year_score"] = portfolio_lab_df["ten_year_assets_twd"] / max_ten * 100.0
+    portfolio_lab_df["drawdown_score"] = (100.0 - portfolio_lab_df["max_drawdown_pct"].abs() * 2.0).clip(lower=0, upper=100)
+    portfolio_lab_df["cashflow_score"] = (100.0 - portfolio_lab_df["negative_cashflow_years"] * 8.0).clip(lower=0, upper=100)
+    portfolio_lab_df["concentration_score"] = (
+        100.0
+        - (portfolio_lab_df["ai_semi_exposure_pct"] - 40.0).clip(lower=0) * 1.2
+        - (portfolio_lab_df["single_name_max_pct"] - 15.0).clip(lower=0) * 1.5
+    ).clip(lower=0, upper=100)
+    portfolio_lab_df["ben_win_rate_score"] = (
+        portfolio_lab_df["growth_score"] * 0.30
+        + portfolio_lab_df["ten_year_score"] * 0.20
+        + portfolio_lab_df["drawdown_score"] * 0.20
+        + portfolio_lab_df["cashflow_score"] * 0.15
+        + portfolio_lab_df["concentration_score"] * 0.15
+    ).round(1)
+
+    st.info("判讀方式：終值最高不等於最適合。v10 會同時看成長、防守、現金流、AI/半導體集中度，給出 Ben 專用的人生勝率分數。")
+    st.dataframe(
+        format_table_df(
+            portfolio_lab_df[[
+                "portfolio", "ending_assets_twd", "ten_year_assets_twd", "max_drawdown_pct",
+                "negative_cashflow_years", "ai_semi_exposure_pct", "single_name_max_pct",
+                "ben_win_rate_score", "life_fit_score_old"
+            ]],
+            pct_cols=["max_drawdown_pct", "ai_semi_exposure_pct", "single_name_max_pct"],
+            human_cols=["ending_assets_twd", "ten_year_assets_twd"],
+        ),
+        width="stretch",
+        hide_index=True,
+    )
+
     lab_cols = st.columns(2)
-    lab_cols[0].plotly_chart(px.bar(portfolio_lab_df, x="portfolio", y="ending_assets_twd", title="單一路徑終值比較"), width="stretch")
-    lab_cols[1].plotly_chart(px.bar(portfolio_lab_df, x="portfolio", y="max_drawdown_pct", title="最大回撤比較（越接近 0 越舒服）"), width="stretch")
+    lab_cols[0].plotly_chart(px.bar(portfolio_lab_df, x="portfolio", y="ending_assets_twd", title="單一路徑終值比較：誰跑最高"), width="stretch")
+    lab_cols[1].plotly_chart(px.bar(portfolio_lab_df.sort_values("ben_win_rate_score", ascending=False), x="portfolio", y="ben_win_rate_score", title="Ben 人生勝率分數：誰更適合"), width="stretch")
+
+    risk_cols = st.columns(2)
+    risk_cols[0].plotly_chart(px.bar(portfolio_lab_df, x="portfolio", y="ai_semi_exposure_pct", title="AI / 半導體合併曝險：越高越集中"), width="stretch")
+    risk_cols[1].plotly_chart(px.bar(portfolio_lab_df, x="portfolio", y="max_drawdown_pct", title="最大回撤比較：理論上應 ≤ 0，越接近 0 越舒服"), width="stretch")
+
+    st.markdown("#### Current → Candidate 交換代價表")
+    if "Current" in portfolio_lab_df["portfolio"].values and "Candidate" in portfolio_lab_df["portfolio"].values:
+        cur_row = portfolio_lab_df.loc[portfolio_lab_df["portfolio"].eq("Current")].iloc[0]
+        can_row = portfolio_lab_df.loc[portfolio_lab_df["portfolio"].eq("Candidate")].iloc[0]
+        tradeoff_df = pd.DataFrame([
+            {"metric": "20年終值差異（Candidate - Current）", "value": can_row["ending_assets_twd"] - cur_row["ending_assets_twd"], "interpretation": "若為負，代表換取安全性會犧牲紙上上檔。"},
+            {"metric": "10年資產差異（Candidate - Current）", "value": can_row["ten_year_assets_twd"] - cur_row["ten_year_assets_twd"], "interpretation": "看教育費高峰前後的資產差距。"},
+            {"metric": "最大回撤差異（Candidate - Current，百分點）", "value": can_row["max_drawdown_pct"] - cur_row["max_drawdown_pct"], "interpretation": "若更接近 0，代表壞年份較舒服。"},
+            {"metric": "AI/半導體曝險差異（Candidate - Current，百分點）", "value": can_row["ai_semi_exposure_pct"] - cur_row["ai_semi_exposure_pct"], "interpretation": "若為負，代表降低同一主題重複押注。"},
+            {"metric": "Ben人生勝率分數差異", "value": can_row["ben_win_rate_score"] - cur_row["ben_win_rate_score"], "interpretation": "若為正，代表犧牲部分上檔後，整體人生適配可能更好。"},
+        ])
+        st.dataframe(format_table_df(tradeoff_df, human_cols=["value"]), width="stretch", hide_index=True)
+
+    st.markdown("#### 人生階段目標覆蓋率（單一路徑）")
+    goal_rows = []
+    if not life_targets_df.empty and not life_paths_df.empty:
+        for _, tgt in life_targets_df.iterrows():
+            target_age = int(tgt["age"])
+            for label in portfolio_lab_df["portfolio"].tolist():
+                sub = life_paths_df.loc[life_paths_df["portfolio"].eq(label)].copy()
+                if sub.empty:
+                    continue
+                sub["age_gap"] = (sub["age"] - target_age).abs()
+                nearest = sub.sort_values("age_gap").iloc[0]
+                total_assets = _safe_float(nearest["total_assets_twd"])
+                low = _safe_float(tgt["total_assets_low_twd"], 1.0)
+                high = _safe_float(tgt["total_assets_high_twd"], 1.0)
+                goal_rows.append({
+                    "portfolio": label,
+                    "target_age": target_age,
+                    "actual_age_used": int(nearest["age"]),
+                    "total_assets_twd": total_assets,
+                    "target_low_twd": low,
+                    "target_high_twd": high,
+                    "coverage_to_low_pct": total_assets / max(low, 1.0) * 100.0,
+                    "coverage_to_high_pct": total_assets / max(high, 1.0) * 100.0,
+                    "status": "超過高標" if total_assets >= high else ("達低標" if total_assets >= low else "未達低標"),
+                })
+    goal_coverage_df = pd.DataFrame(goal_rows)
+    if not goal_coverage_df.empty:
+        st.dataframe(format_table_df(goal_coverage_df, pct_cols=["coverage_to_low_pct", "coverage_to_high_pct"], human_cols=["total_assets_twd", "target_low_twd", "target_high_twd"]), width="stretch", hide_index=True)
+        st.plotly_chart(px.bar(goal_coverage_df, x="target_age", y="coverage_to_low_pct", color="portfolio", barmode="group", title="各年齡目標覆蓋率：100% = 達到合理低標"), width="stretch")
+
+    st.markdown("#### v10 初步判讀")
+    best_growth = portfolio_lab_df.sort_values("ending_assets_twd", ascending=False).iloc[0]["portfolio"]
+    best_fit = portfolio_lab_df.sort_values("ben_win_rate_score", ascending=False).iloc[0]["portfolio"]
+    st.write(f"- **終值最高**：{best_growth}。這代表它在目前假設下最有上檔，但不代表最適合。")
+    st.write(f"- **Ben 人生勝率分數最高**：{best_fit}。這是把終值、回撤、現金流與集中度一起考慮後的結果。")
+    st.write("- 若 Current 終值最高但 AI/半導體曝險也最高，代表它是『進攻型路徑』；是否要調整，應看 Candidate 犧牲多少上檔、換到多少風險下降。")
+
 
     st.markdown("### J. AI / 半導體曝險儀表")
     us_investment_twd = float(current_edited.get("market_value_usd", pd.Series(dtype=float)).sum() * fx_rate) if "market_value_usd" in current_edited.columns else 0.0

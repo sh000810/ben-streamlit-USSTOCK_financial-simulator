@@ -885,7 +885,7 @@ def simulate_portfolio(
         end_total_assets = float(max(0.0, holdings["value_twd"].sum()))
         end_cash = float(holdings.loc[holdings["asset_class"] == "Cash", "value_twd"].sum())
         peak_assets = max(peak_assets, end_total_assets)
-        drawdown_pct = (end_total_assets / peak_assets - 1.0) * 100 if peak_assets > 0 else 0.0
+        drawdown_pct = min(0.0, (end_total_assets / peak_assets - 1.0) * 100) if peak_assets > 0 else 0.0
         min_cash_buffer_months = end_cash / (total_expense / 12.0) if total_expense > 0 else 0.0
 
         if ruin_year is None and (end_total_assets <= 0 or leftover_deficit > 0):
@@ -1300,7 +1300,7 @@ def simulate_portfolio(
         end_cash = float(holdings.loc[holdings["asset_class"] == "Cash", "value_twd"].sum())
         peak_assets_before_year = max(peak_assets, start_total_assets)
         drawdown_base_assets_twd = min(end_total_assets, intrayear_trough_assets_twd)
-        drawdown_pct = (drawdown_base_assets_twd / peak_assets_before_year - 1.0) * 100 if peak_assets_before_year > 0 else 0.0
+        drawdown_pct = min(0.0, (drawdown_base_assets_twd / peak_assets_before_year - 1.0) * 100) if peak_assets_before_year > 0 else 0.0
         peak_assets = max(peak_assets, end_total_assets)
         cash_buffer_months = end_cash / (total_expense / 12.0) if total_expense > 0 else 0.0
 
