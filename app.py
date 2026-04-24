@@ -73,8 +73,8 @@ EXTERNAL_ASSUMPTIONS_DF = pd.DataFrame()
 EXTERNAL_ASSUMPTIONS_STATUS = "未匯入"
 
 st.set_page_config(page_title="Ben 財務與投資模擬器", layout="wide")
-st.title("Ben 財務與投資模擬器 · v10 股票配置決策版")
-st.caption("v10：在 v9 人生資產地圖基礎上，新增 Ben 人生勝率分數、Current→Candidate 交換代價表、目標覆蓋率與 AI/半導體集中度決策儀表。")
+st.title("Ben 財務與投資模擬器 · v11 風險引擎版")
+st.caption("v11.1：校準風險引擎，採用 shared shock tape、bull-neutral-bear-crash regime、AI/半導體同跌懲罰與真實 path drawdown。")
 
 st.markdown("""
 <style>
@@ -1904,8 +1904,9 @@ with main_tabs[7]:
         else:
             st.success("目前單一路徑下未出現年度負現金流；仍建議用 Monte Carlo 檢查 P5 worst case。")
 
-    st.markdown("### I. v10 股票配置決策儀表板")
+    st.markdown("### I. v11 股票配置決策儀表板")
     st.caption("這一區不再只問『誰終值最高』，而是回答：Current 多出來的上檔，是否值得承擔多出來的集中與回撤風險。")
+    st.warning("v11 已啟用風險引擎：年度報酬會受到 volatility、shared crash、risk-group correlation 影響；若 Current 仍勝出，才比較有參考價值。")
 
     def _safe_float(value, default=0.0):
         try:
@@ -1976,7 +1977,7 @@ with main_tabs[7]:
         + portfolio_lab_df["concentration_score"] * 0.15
     ).round(1)
 
-    st.info("判讀方式：終值最高不等於最適合。v10 會同時看成長、防守、現金流、AI/半導體集中度，給出 Ben 專用的人生勝率分數。")
+    st.info("判讀方式：終值最高不等於最適合。v11 會同時看成長、防守、現金流、AI/半導體集中度，並透過波動、崩盤與同跌風險引擎，給出 Ben 專用的人生勝率分數。")
     st.dataframe(
         format_table_df(
             portfolio_lab_df[[
@@ -2042,7 +2043,7 @@ with main_tabs[7]:
         st.dataframe(format_table_df(goal_coverage_df, pct_cols=["coverage_to_low_pct", "coverage_to_high_pct"], human_cols=["total_assets_twd", "target_low_twd", "target_high_twd"]), width="stretch", hide_index=True)
         st.plotly_chart(px.bar(goal_coverage_df, x="target_age", y="coverage_to_low_pct", color="portfolio", barmode="group", title="各年齡目標覆蓋率：100% = 達到合理低標"), width="stretch")
 
-    st.markdown("#### v10 初步判讀")
+    st.markdown("#### v11 初步判讀")
     best_growth = portfolio_lab_df.sort_values("ending_assets_twd", ascending=False).iloc[0]["portfolio"]
     best_fit = portfolio_lab_df.sort_values("ben_win_rate_score", ascending=False).iloc[0]["portfolio"]
     st.write(f"- **終值最高**：{best_growth}。這代表它在目前假設下最有上檔，但不代表最適合。")

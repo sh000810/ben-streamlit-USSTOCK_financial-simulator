@@ -1968,3 +1968,939 @@ def build_voo_benchmark_portfolio() -> pd.DataFrame:
             "sell_priority": int(cls["sell_priority"]), "include": True,
         })
     return pd.DataFrame(rows)
+
+
+# ===== v11 overrides: real risk engine (volatility + crash + correlation) =====
+# Purpose:
+# - Previous single-path portfolio lab could look too smooth because fixed scenarios used mean returns.
+# - v11 makes risk visible in every simulation path: correlated market shocks, group shocks,
+#   idiosyncratic noise, and occasional crash events.
+# - run_monte_carlo_compare is also overridden so all portfolios share the same shock seed per simulation.
+
+CRASH_GROUP_MULTIPLIER = {
+    "cash": 0.00,
+    "market_core": 0.95,
+    "ai_core": 1.45,
+    "semi": 1.35,
+    "cloud": 1.25,
+    "software": 1.20,
+    "infra": 1.10,
+    "compounders": 0.80,
+    "industrial": 0.90,
+    "defensive": 0.55,
+    "other": 1.00,
+}
+
+
+def _scenario_crash_parameters(scenario: pd.Series, mode_name: str) -> Dict[str, float]:
+    """Return crash parameters for a scenario.
+
+    Values are intentionally conservative and transparent. They are not predictions;
+    they are stress-test mechanics to prevent high-volatility portfolios from being
+    evaluated in a fantasy world where volatility never bites.
+    """
+    name = str(scenario.get("scenario_name", ""))
+    max_dd_hint = abs(float(scenario.get("max_drawdown_hint_pct", -35.0) or -35.0))
+    vol_mult = float(scenario.get("vol_multiplier", 1.0) or 1.0)
+
+    # Base probability of at least one meaningful market correction in any given year.
+    crash_prob = 0.08
+    severe_prob = 0.018
+    min_depth = 0.16
+    max_depth = max(0.28, min(0.60, max_dd_hint / 100.0))
+
+    if "先殺" in name or mode_name == "path":
+        crash_prob = 0.16
+        severe_prob = 0.030
+        min_depth = 0.20
+        max_depth = max(max_depth, 0.48)
+    elif "景氣壓力" in name:
+        crash_prob = 0.14
+        severe_prob = 0.035
+        min_depth = 0.18
+        max_depth = max(max_depth, 0.45)
+    elif "AI 成長是真的" in name or "不如預期" in name:
+        crash_prob = 0.12
+        severe_prob = 0.025
+        min_depth = 0.16
+        max_depth = max(max_depth, 0.38)
+    elif "AI 超級大牛市" in name:
+        crash_prob = 0.045
+        severe_prob = 0.008
+        min_depth = 0.10
+        max_depth = max(0.24, min(max_depth, 0.34))
+
+    # Volatility multiplier should modestly increase crash chance.
+    crash_prob = min(0.25, crash_prob * max(0.75, vol_mult))
+    severe_prob = min(0.08, severe_prob * max(0.75, vol_mult))
+    return {
+        "crash_prob": crash_prob,
+        "severe_prob": severe_prob,
+        "min_depth": min_depth,
+        "max_depth": max_depth,
+    }
+
+
+def _build_year_risk_shock(
+    *,
+    scenario: pd.Series,
+    mode_name: str,
+    rng: np.random.Generator,
+    groups: Iterable[str],
+    year_index: int,
+) -> Dict[str, object]:
+    """Build one year of shared risk shocks.
+
+    The same year shock should be reused across portfolios in the same simulation seed.
+    Groups are sorted to keep deterministic RNG order.
+    """
+    market_z = float(rng.standard_normal())
+    group_zs = {str(g): float(rng.standard_normal()) for g in sorted(set(groups))}
+
+    params = _scenario_crash_parameters(scenario, mode_name)
+    crash_flag = False
+    crash_depth = 0.0
+
+    # Path mode has an explicit early valuation reset; we still record it as a crash-like event.
+    early_years = int(scenario.get("early_negative_years", 0) or 0)
+    if mode_name == "path" and early_years > 0 and year_index <= early_years:
+        crash_flag = True
+        crash_depth = abs(float(scenario.get("early_negative_return_pct", -18.0) or -18.0)) / 100.0
+    else:
+        if rng.random() < params["crash_prob"]:
+            crash_flag = True
+            if rng.random() < params["severe_prob"] / max(params["crash_prob"], 1e-9):
+                low = max(params["min_depth"], 0.30)
+                high = max(low + 0.01, params["max_depth"])
+                crash_depth = float(rng.uniform(low, high))
+            else:
+                crash_depth = float(rng.uniform(params["min_depth"], max(params["min_depth"] + 0.01, params["max_depth"] * 0.75)))
+
+    return {
+        "market_z": market_z,
+        "group_zs": group_zs,
+        "crash_flag": crash_flag,
+        "crash_depth": crash_depth,
+    }
+
+
+def _calc_return_for_row_v11(
+    row: pd.Series,
+    scenario: pd.Series,
+    year_index: int,
+    mode_override: Optional[str],
+    rng: np.random.Generator,
+    year_shock: Dict[str, object],
+) -> float:
+    mode = (mode_override or scenario.get("mode", "fixed") or "fixed").strip()
+    mean = float(row.get("expected_return", 0.0)) + float(scenario.get("market_return_shift_pct", 0.0)) / 100.0
+    if bool(row.get("ai_direct", False)):
+        mean += float(scenario.get("ai_excess_return_pct", 0.0)) / 100.0
+    vol = max(0.0, float(row.get("volatility", 0.0)) * float(scenario.get("vol_multiplier", 1.0)))
+    group = str(row.get("risk_group", "other"))
+    asset_class = str(row.get("asset_class", "")).lower()
+
+    # Cash should stay boring. It can still earn expected return, but it should not crash.
+    if asset_class == "cash" or group == "cash":
+        return float(np.clip(mean, -0.02, 0.05))
+
+    # Path scenario has explicit early shock / recovery. After the path window, use stochastic risk.
+    if mode == "path":
+        early_years = int(scenario.get("early_negative_years", 0) or 0)
+        recovery_years = int(scenario.get("recovery_years", 0) or 0)
+        if year_index <= early_years:
+            base = float(scenario.get("early_negative_return_pct", -10.0)) / 100.0
+            if bool(row.get("ai_direct", False)):
+                base += float(scenario.get("early_ai_penalty_pct", 0.0)) / 100.0
+            crash_mult = CRASH_GROUP_MULTIPLIER.get(group, 1.0)
+            # Make semi/AI assets visibly more painful in valuation-reset years.
+            return float(np.clip(base * max(0.8, crash_mult), -0.95, 2.0))
+        if year_index <= early_years + recovery_years:
+            mean += float(scenario.get("recovery_boost_pct", 0.0)) / 100.0
+
+    market_z = float(year_shock.get("market_z", 0.0))
+    group_zs = year_shock.get("group_zs", {}) or {}
+    group_z = float(group_zs.get(group, 0.0))
+    idio_z = float(rng.standard_normal())
+
+    # Correlation structure: market dominates, group shock adds same-theme clustering,
+    # idiosyncratic noise remains but is deliberately small.
+    correlated_shock = 0.68 * market_z + 0.24 * group_z + 0.08 * idio_z
+    value = mean + vol * correlated_shock
+
+    if bool(year_shock.get("crash_flag", False)):
+        depth = float(year_shock.get("crash_depth", 0.0))
+        crash_mult = CRASH_GROUP_MULTIPLIER.get(group, 1.0)
+        # AI/semis get an extra valuation-compression penalty in crashes.
+        ai_penalty = 0.03 if bool(row.get("ai_direct", False)) and group in {"ai_core", "semi", "cloud", "software", "infra"} else 0.0
+        value -= depth * crash_mult + ai_penalty
+
+    return float(np.clip(value, -0.95, 2.0))
+
+
+def simulate_portfolio(
+    portfolio_df: pd.DataFrame,
+    scenario: pd.Series,
+    years: int,
+    start_assets_twd: float,
+    start_age: int,
+    current_year: int,
+    salary_annual: float,
+    salary_growth_pct: float,
+    retirement_age: int,
+    tuotuozu_mode: str,
+    tuotuozu_base_annual: float,
+    tuotuozu_decay_pct: float,
+    tuotuozu_projection_list: Optional[List[float]],
+    tuotuozu_fallback_mode: str,
+    living_expense_annual: float,
+    inflation_pct: float,
+    edu_phase1_annual: float,
+    edu_phase2_annual: float,
+    mortgage_annual: float,
+    inheritance_age: int,
+    inherited_rent_monthly: float,
+    withdrawal_strategy: str,
+    rebalance_frequency_years: int,
+    mode_override: Optional[str],
+    seed: int = 42,
+) -> pd.DataFrame:
+    """v11 portfolio simulation with real risk.
+
+    Key changes vs older versions:
+    - volatility affects every path, not only explicit Monte Carlo mode;
+    - crashes happen as shared annual events;
+    - risk-group correlation makes AI/semi holdings fall together;
+    - drawdown is based on peak-to-trough and cannot be positive.
+    """
+    holdings = portfolio_to_sim_input(portfolio_df, start_assets_twd)
+    if holdings.empty:
+        return pd.DataFrame()
+
+    rng = np.random.default_rng(seed)
+    peak_assets = start_assets_twd
+    ruin_year = None
+    records = []
+    mode_name = (mode_override or scenario.get("mode", "fixed") or "fixed").strip()
+
+    for year_idx in range(1, years + 1):
+        cal_year = current_year + year_idx - 1
+        age = start_age + year_idx - 1
+        start_total_assets = float(holdings["value_twd"].sum())
+        if start_total_assets <= 0:
+            start_total_assets = 0.0
+
+        effect_stats = portfolio_effective_stats(holdings, scenario, year_idx, mode_override)
+        groups = holdings.get("risk_group", pd.Series("other", index=holdings.index)).fillna("other").astype(str).tolist()
+        year_shock = _build_year_risk_shock(
+            scenario=scenario,
+            mode_name=mode_name,
+            rng=rng,
+            groups=groups,
+            year_index=year_idx,
+        )
+
+        returns = []
+        for _, row in holdings.iterrows():
+            returns.append(_calc_return_for_row_v11(row, scenario, year_idx, mode_override, rng, year_shock))
+        holdings["annual_return"] = returns
+        holdings["value_twd"] = holdings["value_twd"] * (1.0 + holdings["annual_return"])
+
+        end_before_cashflow = float(holdings["value_twd"].sum())
+        portfolio_return_pct = (end_before_cashflow / start_total_assets - 1.0) * 100 if start_total_assets > 0 else -100.0
+        portfolio_vol_estimate_pct = estimate_portfolio_volatility_pct(holdings)
+
+        # A transparent intra-year trough proxy. It incorporates volatility and crash depth;
+        # it prevents high-growth annual paths from pretending that no painful drawdown occurred.
+        crash_depth_pct = float(year_shock.get("crash_depth", 0.0)) * 100.0 if year_shock.get("crash_flag", False) else 0.0
+        stress_factor = 0.35 + min(0.45, portfolio_vol_estimate_pct / 100.0)
+        intrayear_trough_return_pct = min(
+            portfolio_return_pct,
+            portfolio_return_pct - portfolio_vol_estimate_pct * stress_factor - crash_depth_pct * 0.35,
+        )
+        intrayear_trough_assets_twd = max(0.0, start_total_assets * (1.0 + intrayear_trough_return_pct / 100.0))
+
+        salary_income = _salary_income_for_year(salary_annual, salary_growth_pct, start_age, retirement_age, year_idx)
+        effective_decay = float(scenario.get("business_decay_pct", tuotuozu_decay_pct))
+        tuotuozu_income = _tuotuozu_income_for_year(
+            year_idx,
+            tuotuozu_base_annual,
+            effective_decay,
+            tuotuozu_mode,
+            tuotuozu_projection_list,
+            tuotuozu_fallback_mode,
+        )
+        effective_inflation = float(scenario.get("inflation_pct", inflation_pct)) / 100.0
+        living_expense = living_expense_annual * ((1.0 + effective_inflation) ** (year_idx - 1))
+        education = education_cost_for_year(cal_year, edu_phase1_annual, edu_phase2_annual) * float(scenario.get("education_multiplier", 1.0))
+        inheritance_income = inherited_rent_monthly * 12.0 if age >= inheritance_age else 0.0
+
+        total_income = salary_income + tuotuozu_income + inheritance_income
+        total_expense = living_expense + education + mortgage_annual
+        net_cashflow = total_income - total_expense
+        withdrawal = 0.0
+        leftover_deficit = 0.0
+
+        if net_cashflow >= 0:
+            cash_mask = holdings["asset_class"].eq("Cash")
+            if cash_mask.any():
+                first_cash_idx = holdings.index[cash_mask][0]
+                holdings.at[first_cash_idx, "value_twd"] += net_cashflow
+            else:
+                cash_row = pd.DataFrame([{
+                    "ticker": "Cash",
+                    "name": "Cash",
+                    "asset_class": "Cash",
+                    "theme": "Cash",
+                    "role_bucket": "安全墊",
+                    "risk_group": "cash",
+                    "ai_direct": False,
+                    "expected_return": 0.015,
+                    "volatility": 0.0,
+                    "weight": 0.0,
+                    "value_twd": net_cashflow,
+                    "sell_priority": 0,
+                    "annual_return": 0.0,
+                }])
+                holdings = pd.concat([holdings, cash_row], ignore_index=True)
+        else:
+            withdrawal = -net_cashflow
+            holdings, leftover_deficit = _apply_withdrawal_strategy(holdings, withdrawal, withdrawal_strategy)
+
+        holdings = maybe_rebalance(holdings, rebalance_frequency_years, year_idx)
+        end_total_assets = float(max(0.0, holdings["value_twd"].sum()))
+        end_cash = float(holdings.loc[holdings["asset_class"].eq("Cash"), "value_twd"].sum())
+
+        peak_before_year = max(peak_assets, start_total_assets)
+        trough_assets_twd = min(end_total_assets, intrayear_trough_assets_twd)
+        drawdown_pct = min(0.0, (trough_assets_twd / peak_before_year - 1.0) * 100.0) if peak_before_year > 0 else 0.0
+        peak_assets = max(peak_assets, end_total_assets)
+        cash_buffer_months = end_cash / (total_expense / 12.0) if total_expense > 0 else 0.0
+
+        if ruin_year is None and (end_total_assets <= 0 or leftover_deficit > 0):
+            ruin_year = cal_year
+
+        records.append({
+            "year_index": year_idx,
+            "calendar_year": cal_year,
+            "age": age,
+            "start_assets_twd": start_total_assets,
+            "base_portfolio_return_pct": effect_stats["base_portfolio_return_pct"],
+            "market_return_shift_pct": effect_stats["market_shift_pct"],
+            "weighted_ai_excess_shift_pct": effect_stats["weighted_ai_excess_shift_pct"],
+            "scenario_shift_pct": effect_stats["scenario_shift_pct"],
+            "effective_return_pct": effect_stats["effective_expected_return_pct"],
+            "effective_portfolio_return_pct": effect_stats["effective_expected_return_pct"],
+            "base_portfolio_vol_pct": effect_stats["base_portfolio_vol_pct"],
+            "effective_portfolio_vol_pct": effect_stats["effective_portfolio_vol_pct"],
+            "ai_direct_weight_pct": effect_stats["ai_direct_weight_pct"],
+            "portfolio_return_pct": portfolio_return_pct,
+            "portfolio_vol_estimate_pct": portfolio_vol_estimate_pct,
+            "market_z": float(year_shock.get("market_z", 0.0)),
+            "crash_flag": int(bool(year_shock.get("crash_flag", False))),
+            "crash_depth_pct": crash_depth_pct,
+            "intrayear_trough_assets_twd": intrayear_trough_assets_twd,
+            "drawdown_method": "v11 risk engine: peak vs min(end_assets, volatility/crash intrayear trough)",
+            "end_before_cashflow_twd": end_before_cashflow,
+            "salary_income_twd": salary_income,
+            "tuotuozu_income_twd": tuotuozu_income,
+            "business_income_twd": tuotuozu_income,
+            "inheritance_income_twd": inheritance_income,
+            "living_expense_twd": living_expense,
+            "education_expense_twd": education,
+            "mortgage_expense_twd": mortgage_annual,
+            "total_income_twd": total_income,
+            "total_expense_twd": total_expense,
+            "net_cashflow_twd": net_cashflow,
+            "withdrawal_twd": withdrawal,
+            "uncovered_deficit_twd": leftover_deficit,
+            "end_cash_twd": end_cash,
+            "end_assets_twd": end_total_assets,
+            "drawdown_pct": drawdown_pct,
+            "cash_buffer_months": cash_buffer_months,
+            "ruin_flag": 1 if ruin_year is not None else 0,
+        })
+
+    result = pd.DataFrame(records)
+    result["ruin_year"] = ruin_year
+    return result
+
+
+def run_monte_carlo_compare(
+    current_portfolio: pd.DataFrame,
+    recommended_portfolio: pd.DataFrame,
+    custom_portfolio: Optional[pd.DataFrame],
+    scenario: pd.Series,
+    years: int,
+    start_assets_twd: float,
+    start_age: int,
+    current_year: int,
+    salary_annual: float,
+    salary_growth_pct: float,
+    retirement_age: int,
+    tuotuozu_mode: str,
+    tuotuozu_base_annual: float,
+    tuotuozu_decay_pct: float,
+    tuotuozu_projection_list: Optional[List[float]],
+    tuotuozu_fallback_mode: str,
+    living_expense_annual: float,
+    inflation_pct: float,
+    edu_phase1_annual: float,
+    edu_phase2_annual: float,
+    mortgage_annual: float,
+    inheritance_age: int,
+    inherited_rent_monthly: float,
+    withdrawal_strategy: str,
+    rebalance_frequency_years: int,
+    mode_override: Optional[str],
+    simulations: int = 300,
+    seed: int = 42,
+) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    """v11 fair Monte Carlo comparison.
+
+    All portfolios use the same simulation seed for the same simulation_id, so the
+    comparison is much closer to an A/B test under the same market weather.
+    """
+    portfolio_inputs = {"Current": current_portfolio, "Recommended": recommended_portfolio}
+    if custom_portfolio is not None:
+        portfolio_inputs["Custom"] = custom_portfolio
+
+    rows = []
+    for i in range(simulations):
+        sim_seed = seed + i
+        sim_row = {"simulation": i + 1, "shared_seed": sim_seed}
+        finals = {}
+        for name, portfolio in portfolio_inputs.items():
+            result = simulate_portfolio(
+                portfolio, scenario, years, start_assets_twd, start_age, current_year,
+                salary_annual, salary_growth_pct, retirement_age,
+                tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct,
+                tuotuozu_projection_list, tuotuozu_fallback_mode,
+                living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual, mortgage_annual,
+                inheritance_age, inherited_rent_monthly, withdrawal_strategy, rebalance_frequency_years, mode_override,
+                seed=sim_seed,
+            )
+            final_assets = float(result.iloc[-1]["end_assets_twd"]) if not result.empty else 0.0
+            ruin_flag = int((result["uncovered_deficit_twd"] > 0).any() or (result["end_assets_twd"] <= 0).any()) if not result.empty else 1
+            max_drawdown = float(result["drawdown_pct"].min()) if not result.empty else -100.0
+            p_min_cash = float(result["cash_buffer_months"].min()) if not result.empty else 0.0
+            crash_years = int(result["crash_flag"].sum()) if not result.empty and "crash_flag" in result.columns else 0
+            key = name.lower().replace("%", "pct").replace(" ", "_")
+            sim_row[f"{key}_final_assets_twd"] = final_assets
+            sim_row[f"{key}_ruin"] = ruin_flag
+            sim_row[f"{key}_max_drawdown_pct"] = max_drawdown
+            sim_row[f"{key}_min_cash_buffer_months"] = p_min_cash
+            sim_row[f"{key}_crash_years"] = crash_years
+            finals[name] = final_assets
+        sim_row["recommended_beats_current"] = int(finals.get("Recommended", 0.0) > finals.get("Current", 0.0))
+        if "Custom" in finals:
+            sim_row["recommended_beats_custom"] = int(finals.get("Recommended", 0.0) > finals.get("Custom", 0.0))
+            sim_row["current_beats_custom"] = int(finals.get("Current", 0.0) > finals.get("Custom", 0.0))
+        rows.append(sim_row)
+
+    sims = pd.DataFrame(rows)
+    metrics: Dict[str, float] = {}
+    for name in portfolio_inputs:
+        key = name.lower().replace("%", "pct").replace(" ", "_")
+        final_col = f"{key}_final_assets_twd"
+        ruin_col = f"{key}_ruin"
+        drawdown_col = f"{key}_max_drawdown_pct"
+        metrics[f"{name} P50 終值"] = float(sims[final_col].median())
+        metrics[f"{name} P25 終值"] = float(sims[final_col].quantile(0.25))
+        metrics[f"{name} P75 終值"] = float(sims[final_col].quantile(0.75))
+        metrics[f"{name} P5 Worst Case 終值"] = float(sims[final_col].quantile(0.05))
+        metrics[f"{name} 資產耗盡機率"] = float(sims[ruin_col].mean() * 100.0)
+        metrics[f"{name} 最大回撤中位數"] = float(sims[drawdown_col].median())
+        metrics[f"{name} P5 最大回撤"] = float(sims[drawdown_col].quantile(0.05))
+    metrics["Recommended 勝過 Current 機率"] = float(sims["recommended_beats_current"].mean() * 100.0)
+    if "recommended_beats_custom" in sims.columns:
+        metrics["Recommended 勝過 Custom 機率"] = float(sims["recommended_beats_custom"].mean() * 100.0)
+    if "current_beats_custom" in sims.columns:
+        metrics["Current 勝過 Custom 機率"] = float(sims["current_beats_custom"].mean() * 100.0)
+    return sims, metrics
+
+
+# ===== v11.1 overrides: calibrated regime risk engine =====
+# Design principle:
+# - keep the prior transparent assumption/bucket framework;
+# - make risk path-dependent and visible;
+# - use a shared shock tape for fair portfolio comparisons;
+# - separate expected return from bear/crash stress so high-return concentrated portfolios are not automatically judged "best".
+
+CANONICAL_RISK_GROUPS = [
+    "cash", "market_core", "ai_core", "semi", "cloud", "software",
+    "infra", "compounders", "industrial", "defensive", "other"
+]
+
+REGIME_GROUP_MULTIPLIER = {
+    "cash": 0.00,
+    "market_core": 1.00,
+    "ai_core": 1.55,
+    "semi": 1.45,
+    "cloud": 1.30,
+    "software": 1.25,
+    "infra": 1.15,
+    "compounders": 0.82,
+    "industrial": 0.92,
+    "defensive": 0.60,
+    "other": 1.00,
+}
+
+
+def _v111_regime_probabilities(scenario: pd.Series, mode_name: str) -> Dict[str, float]:
+    """Return annual regime probabilities.
+
+    These are stress-test probabilities, not forecasts. The purpose is to keep
+    single-path and Monte Carlo outputs from living in a no-risk world.
+    """
+    name = str(scenario.get("scenario_name", ""))
+    vol_mult = float(scenario.get("vol_multiplier", 1.0) or 1.0)
+
+    probs = {"bull": 0.30, "neutral": 0.40, "bear": 0.22, "crash": 0.08}
+    if "AI 超級大牛市" in name:
+        probs = {"bull": 0.42, "neutral": 0.42, "bear": 0.12, "crash": 0.04}
+    elif "先殺" in name or mode_name == "path":
+        probs = {"bull": 0.22, "neutral": 0.34, "bear": 0.30, "crash": 0.14}
+    elif "景氣壓力" in name:
+        probs = {"bull": 0.18, "neutral": 0.34, "bear": 0.32, "crash": 0.16}
+    elif "不如預期" in name or "AI 成長是真的" in name:
+        probs = {"bull": 0.20, "neutral": 0.40, "bear": 0.28, "crash": 0.12}
+
+    # Higher-vol scenarios modestly tilt from bull/neutral into bear/crash.
+    if vol_mult > 1.0:
+        extra = min(0.08, (vol_mult - 1.0) * 0.10)
+        probs["bear"] += extra * 0.65
+        probs["crash"] += extra * 0.35
+        probs["neutral"] = max(0.05, probs["neutral"] - extra * 0.50)
+        probs["bull"] = max(0.05, probs["bull"] - extra * 0.50)
+
+    total = sum(probs.values())
+    return {k: float(v / total) for k, v in probs.items()}
+
+
+def _v111_draw_regime(rng: np.random.Generator, probs: Dict[str, float]) -> str:
+    keys = ["bull", "neutral", "bear", "crash"]
+    p = np.array([probs[k] for k in keys], dtype=float)
+    p = p / p.sum()
+    return str(rng.choice(keys, p=p))
+
+
+def _v111_regime_market_return(regime: str, rng: np.random.Generator, scenario: pd.Series, year_index: int, mode_name: str) -> float:
+    """Shared market regime return, expressed as decimal.
+
+    Bear/crash values are broad market shocks before group multipliers.
+    """
+    if mode_name == "path":
+        early_years = int(scenario.get("early_negative_years", 0) or 0)
+        recovery_years = int(scenario.get("recovery_years", 0) or 0)
+        if early_years > 0 and year_index <= early_years:
+            return float(scenario.get("early_negative_return_pct", -18.0) or -18.0) / 100.0
+        if recovery_years > 0 and year_index <= early_years + recovery_years:
+            return float(scenario.get("recovery_boost_pct", 7.0) or 7.0) / 100.0
+
+    max_dd_hint = abs(float(scenario.get("max_drawdown_hint_pct", -35.0) or -35.0)) / 100.0
+    if regime == "bull":
+        return float(rng.uniform(0.06, 0.18))
+    if regime == "neutral":
+        return float(rng.uniform(-0.06, 0.08))
+    if regime == "bear":
+        # A normal bear market / valuation reset.
+        high = max(0.18, min(0.34, max_dd_hint * 0.80))
+        return -float(rng.uniform(0.14, high))
+    # crash
+    high = max(0.34, min(0.62, max_dd_hint * 1.15))
+    return -float(rng.uniform(0.30, high))
+
+
+def _build_year_risk_shock_v111(
+    *,
+    scenario: pd.Series,
+    mode_name: str,
+    rng: np.random.Generator,
+    year_index: int,
+) -> Dict[str, object]:
+    """Build a portfolio-independent annual shock.
+
+    Critical fix vs v11: generate all canonical group shocks first and draw regime
+    without depending on which holdings are inside a particular portfolio. This
+    makes Current / Candidate / VOO comparisons a fair same-weather A/B test.
+    """
+    probs = _v111_regime_probabilities(scenario, mode_name)
+    regime = _v111_draw_regime(rng, probs)
+    market_regime_return = _v111_regime_market_return(regime, rng, scenario, year_index, mode_name)
+    market_z = float(rng.standard_normal())
+    group_zs = {g: float(rng.standard_normal()) for g in CANONICAL_RISK_GROUPS}
+    return {
+        "regime": regime,
+        "market_regime_return": market_regime_return,
+        "market_z": market_z,
+        "group_zs": group_zs,
+        "crash_flag": int(regime == "crash"),
+        "bear_flag": int(regime == "bear"),
+        "crash_depth": abs(market_regime_return) if regime == "crash" else 0.0,
+    }
+
+
+def _build_shock_tape_v111(
+    *,
+    scenario: pd.Series,
+    mode_name: str,
+    years: int,
+    seed: int,
+) -> List[Dict[str, object]]:
+    rng = np.random.default_rng(seed)
+    return [
+        _build_year_risk_shock_v111(scenario=scenario, mode_name=mode_name, rng=rng, year_index=i)
+        for i in range(1, years + 1)
+    ]
+
+
+def _calc_return_for_row_v111(
+    row: pd.Series,
+    scenario: pd.Series,
+    year_index: int,
+    mode_override: Optional[str],
+    rng: np.random.Generator,
+    year_shock: Dict[str, object],
+) -> float:
+    mode = (mode_override or scenario.get("mode", "fixed") or "fixed").strip()
+    mean = float(row.get("expected_return", 0.0)) + float(scenario.get("market_return_shift_pct", 0.0)) / 100.0
+    if bool(row.get("ai_direct", False)):
+        mean += float(scenario.get("ai_excess_return_pct", 0.0)) / 100.0
+
+    group = str(row.get("risk_group", "other"))
+    asset_class = str(row.get("asset_class", "")).lower()
+    vol = max(0.0, float(row.get("volatility", 0.0)) * float(scenario.get("vol_multiplier", 1.0)))
+
+    if asset_class == "cash" or group == "cash":
+        return float(np.clip(mean, -0.01, 0.05))
+
+    regime = str(year_shock.get("regime", "neutral"))
+    market_regime_return = float(year_shock.get("market_regime_return", 0.0))
+    market_z = float(year_shock.get("market_z", 0.0))
+    group_zs = year_shock.get("group_zs", {}) or {}
+    group_z = float(group_zs.get(group, 0.0))
+    idio_z = float(rng.standard_normal())
+
+    # Normal volatility around the expected return.
+    correlated_noise = vol * (0.62 * market_z + 0.28 * group_z + 0.10 * idio_z)
+    value = mean + correlated_noise
+
+    # Regime overlay. Bear/crash should be a shared path shock, not just noise.
+    # Positive bull/neutral regimes are mild; negative regimes use group multipliers.
+    multiplier = REGIME_GROUP_MULTIPLIER.get(group, 1.0)
+    if regime in {"bear", "crash"} or (mode == "path" and market_regime_return < 0):
+        # Subtract the part of broad-market pain relevant to this asset group.
+        # Using the full regime return prevents high expected return from erasing crash risk.
+        value += market_regime_return * multiplier
+        if bool(row.get("ai_direct", False)) and group in {"ai_core", "semi", "cloud", "software", "infra"}:
+            value -= 0.04 if regime == "bear" else 0.08
+    elif regime == "bull":
+        # Upside is shared too, but more muted than downside for high-beta assets.
+        value += market_regime_return * min(multiplier, 1.20) * 0.45
+    else:
+        value += market_regime_return * min(multiplier, 1.05) * 0.25
+
+    # Keep outputs numerically sane.
+    return float(np.clip(value, -0.95, 2.0))
+
+
+def _apply_dynamic_cashflow_pressure_v111(
+    *,
+    scenario: pd.Series,
+    net_cashflow: float,
+    holdings: pd.DataFrame,
+    year_shock: Dict[str, object],
+) -> float:
+    """Stress-test income in bear/crash years.
+
+    Ben's business income is already supplied through Excel/decay. This extra
+    layer is intentionally small and scenario-driven: it models the fact that bad
+    markets and business pressure often arrive together.
+    """
+    name = str(scenario.get("scenario_name", ""))
+    regime = str(year_shock.get("regime", "neutral"))
+    if regime not in {"bear", "crash"}:
+        return net_cashflow
+    pressure = 0.0
+    if "景氣壓力" in name:
+        pressure = 0.08 if regime == "bear" else 0.15
+    elif "不如預期" in name or "先殺" in name:
+        pressure = 0.04 if regime == "bear" else 0.08
+    if pressure <= 0:
+        return net_cashflow
+    risky_value = float(holdings.loc[~holdings["asset_class"].eq("Cash"), "value_twd"].sum()) if not holdings.empty else 0.0
+    return net_cashflow - risky_value * pressure * 0.01
+
+
+def simulate_portfolio(
+    portfolio_df: pd.DataFrame,
+    scenario: pd.Series,
+    years: int,
+    start_assets_twd: float,
+    start_age: int,
+    current_year: int,
+    salary_annual: float,
+    salary_growth_pct: float,
+    retirement_age: int,
+    tuotuozu_mode: str,
+    tuotuozu_base_annual: float,
+    tuotuozu_decay_pct: float,
+    tuotuozu_projection_list: Optional[List[float]],
+    tuotuozu_fallback_mode: str,
+    living_expense_annual: float,
+    inflation_pct: float,
+    edu_phase1_annual: float,
+    edu_phase2_annual: float,
+    mortgage_annual: float,
+    inheritance_age: int,
+    inherited_rent_monthly: float,
+    withdrawal_strategy: str,
+    rebalance_frequency_years: int,
+    mode_override: Optional[str],
+    seed: int = 42,
+    shock_tape: Optional[List[Dict[str, object]]] = None,
+) -> pd.DataFrame:
+    """v11.1 calibrated risk-engine simulation.
+
+    Key fixes:
+    - canonical shared shock tape, independent of portfolio holdings;
+    - annual regimes: bull / neutral / bear / crash;
+    - AI/semi/cloud same-theme assets are hit together in bear/crash regimes;
+    - drawdown uses path peak vs intra-year trough;
+    - cashflow pressure can worsen during explicit stress scenarios.
+    """
+    holdings = portfolio_to_sim_input(portfolio_df, start_assets_twd)
+    if holdings.empty:
+        return pd.DataFrame()
+
+    mode_name = (mode_override or scenario.get("mode", "fixed") or "fixed").strip()
+    if shock_tape is None:
+        shock_tape = _build_shock_tape_v111(scenario=scenario, mode_name=mode_name, years=years, seed=seed)
+    rng = np.random.default_rng(seed + 100_003)
+
+    peak_assets = start_assets_twd
+    ruin_year = None
+    records = []
+
+    for year_idx in range(1, years + 1):
+        cal_year = current_year + year_idx - 1
+        age = start_age + year_idx - 1
+        year_shock = shock_tape[year_idx - 1] if year_idx - 1 < len(shock_tape) else _build_year_risk_shock_v111(
+            scenario=scenario, mode_name=mode_name, rng=rng, year_index=year_idx
+        )
+
+        start_total_assets = float(holdings["value_twd"].sum())
+        effect_stats = portfolio_effective_stats(holdings, scenario, year_idx, mode_override)
+
+        returns = []
+        for _, row in holdings.iterrows():
+            returns.append(_calc_return_for_row_v111(row, scenario, year_idx, mode_override, rng, year_shock))
+        holdings["annual_return"] = returns
+        holdings["value_twd"] = holdings["value_twd"] * (1.0 + holdings["annual_return"])
+
+        end_before_cashflow = float(holdings["value_twd"].sum())
+        portfolio_return_pct = (end_before_cashflow / start_total_assets - 1.0) * 100.0 if start_total_assets > 0 else 0.0
+        portfolio_vol_estimate_pct = estimate_portfolio_volatility_pct(holdings)
+
+        # Intrayear trough proxy: risk exists even if the year ends positive.
+        regime = str(year_shock.get("regime", "neutral"))
+        regime_depth_pct = abs(float(year_shock.get("market_regime_return", 0.0))) * 100.0 if regime in {"bear", "crash"} else 0.0
+        trough_stress_pct = max(
+            portfolio_vol_estimate_pct * (0.55 if regime in {"bull", "neutral"} else 0.85),
+            regime_depth_pct * (0.75 if regime == "bear" else 1.00),
+        )
+        intrayear_trough_assets_twd = max(0.0, start_total_assets * (1.0 - trough_stress_pct / 100.0))
+
+        salary_income = _salary_income_for_year(salary_annual, salary_growth_pct, start_age, retirement_age, year_idx)
+        effective_decay = float(scenario.get("business_decay_pct", tuotuozu_decay_pct))
+        tuotuozu_income = _tuotuozu_income_for_year(
+            year_idx,
+            tuotuozu_base_annual,
+            effective_decay,
+            tuotuozu_mode,
+            tuotuozu_projection_list,
+            tuotuozu_fallback_mode,
+        )
+        effective_inflation = float(scenario.get("inflation_pct", inflation_pct)) / 100.0
+        living_expense = living_expense_annual * ((1.0 + effective_inflation) ** (year_idx - 1))
+        education = education_cost_for_year(cal_year, edu_phase1_annual, edu_phase2_annual) * float(scenario.get("education_multiplier", 1.0))
+        inheritance_income = inherited_rent_monthly * 12.0 if age >= inheritance_age else 0.0
+
+        total_income = salary_income + tuotuozu_income + inheritance_income
+        total_expense = living_expense + education + mortgage_annual
+        net_cashflow = total_income - total_expense
+        net_cashflow = _apply_dynamic_cashflow_pressure_v111(scenario=scenario, net_cashflow=net_cashflow, holdings=holdings, year_shock=year_shock)
+        withdrawal = 0.0
+        leftover_deficit = 0.0
+
+        if net_cashflow >= 0:
+            cash_mask = holdings["asset_class"].eq("Cash")
+            if cash_mask.any():
+                first_cash_idx = holdings.index[cash_mask][0]
+                holdings.at[first_cash_idx, "value_twd"] += net_cashflow
+            else:
+                cash_row = pd.DataFrame([{
+                    "ticker": "Cash", "name": "Cash", "asset_class": "Cash", "theme": "Cash", "role_bucket": "安全墊",
+                    "risk_group": "cash", "ai_direct": False, "expected_return": 0.015, "volatility": 0.0,
+                    "weight": 0.0, "value_twd": net_cashflow, "sell_priority": 0, "annual_return": 0.0,
+                }])
+                holdings = pd.concat([holdings, cash_row], ignore_index=True)
+        else:
+            withdrawal = -net_cashflow
+            holdings, leftover_deficit = _apply_withdrawal_strategy(holdings, withdrawal, withdrawal_strategy)
+
+        holdings = maybe_rebalance(holdings, rebalance_frequency_years, year_idx)
+        end_total_assets = float(max(0.0, holdings["value_twd"].sum()))
+        end_cash = float(holdings.loc[holdings["asset_class"].eq("Cash"), "value_twd"].sum())
+
+        peak_before_year = max(peak_assets, start_total_assets)
+        trough_assets_twd = min(end_total_assets, intrayear_trough_assets_twd)
+        drawdown_pct = min(0.0, (trough_assets_twd / peak_before_year - 1.0) * 100.0) if peak_before_year > 0 else 0.0
+        peak_assets = max(peak_assets, end_total_assets)
+        cash_buffer_months = end_cash / (total_expense / 12.0) if total_expense > 0 else 0.0
+
+        if ruin_year is None and (end_total_assets <= 0 or leftover_deficit > 0):
+            ruin_year = cal_year
+
+        records.append({
+            "year_index": year_idx,
+            "calendar_year": cal_year,
+            "age": age,
+            "start_assets_twd": start_total_assets,
+            "base_portfolio_return_pct": effect_stats["base_portfolio_return_pct"],
+            "market_return_shift_pct": effect_stats["market_shift_pct"],
+            "weighted_ai_excess_shift_pct": effect_stats["weighted_ai_excess_shift_pct"],
+            "scenario_shift_pct": effect_stats["scenario_shift_pct"],
+            "effective_return_pct": effect_stats["effective_expected_return_pct"],
+            "effective_portfolio_return_pct": effect_stats["effective_expected_return_pct"],
+            "base_portfolio_vol_pct": effect_stats["base_portfolio_vol_pct"],
+            "effective_portfolio_vol_pct": effect_stats["effective_portfolio_vol_pct"],
+            "ai_direct_weight_pct": effect_stats["ai_direct_weight_pct"],
+            "portfolio_return_pct": portfolio_return_pct,
+            "portfolio_vol_estimate_pct": portfolio_vol_estimate_pct,
+            "risk_regime": regime,
+            "market_regime_return_pct": float(year_shock.get("market_regime_return", 0.0)) * 100.0,
+            "market_z": float(year_shock.get("market_z", 0.0)),
+            "crash_flag": int(regime == "crash"),
+            "bear_flag": int(regime == "bear"),
+            "crash_depth_pct": abs(float(year_shock.get("market_regime_return", 0.0))) * 100.0 if regime == "crash" else 0.0,
+            "intrayear_trough_assets_twd": intrayear_trough_assets_twd,
+            "drawdown_method": "v11.1 calibrated risk engine: shared regime tape + peak vs intrayear trough",
+            "end_before_cashflow_twd": end_before_cashflow,
+            "salary_income_twd": salary_income,
+            "tuotuozu_income_twd": tuotuozu_income,
+            "business_income_twd": tuotuozu_income,
+            "inheritance_income_twd": inheritance_income,
+            "living_expense_twd": living_expense,
+            "education_expense_twd": education,
+            "mortgage_expense_twd": mortgage_annual,
+            "total_income_twd": total_income,
+            "total_expense_twd": total_expense,
+            "net_cashflow_twd": net_cashflow,
+            "withdrawal_twd": withdrawal,
+            "uncovered_deficit_twd": leftover_deficit,
+            "end_cash_twd": end_cash,
+            "end_assets_twd": end_total_assets,
+            "drawdown_pct": drawdown_pct,
+            "cash_buffer_months": cash_buffer_months,
+            "ruin_flag": 1 if ruin_year is not None else 0,
+        })
+
+    result = pd.DataFrame(records)
+    result["ruin_year"] = ruin_year
+    return result
+
+
+def run_monte_carlo_compare(
+    current_portfolio: pd.DataFrame,
+    recommended_portfolio: pd.DataFrame,
+    custom_portfolio: Optional[pd.DataFrame],
+    scenario: pd.Series,
+    years: int,
+    start_assets_twd: float,
+    start_age: int,
+    current_year: int,
+    salary_annual: float,
+    salary_growth_pct: float,
+    retirement_age: int,
+    tuotuozu_mode: str,
+    tuotuozu_base_annual: float,
+    tuotuozu_decay_pct: float,
+    tuotuozu_projection_list: Optional[List[float]],
+    tuotuozu_fallback_mode: str,
+    living_expense_annual: float,
+    inflation_pct: float,
+    edu_phase1_annual: float,
+    edu_phase2_annual: float,
+    mortgage_annual: float,
+    inheritance_age: int,
+    inherited_rent_monthly: float,
+    withdrawal_strategy: str,
+    rebalance_frequency_years: int,
+    mode_override: Optional[str],
+    simulations: int = 300,
+    seed: int = 42,
+) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    """v11.1 fair Monte Carlo comparison using shared shock tapes."""
+    portfolio_inputs = {"Current": current_portfolio, "Recommended": recommended_portfolio}
+    if custom_portfolio is not None:
+        portfolio_inputs["Custom"] = custom_portfolio
+
+    mode_name = (mode_override or scenario.get("mode", "fixed") or "fixed").strip()
+    rows = []
+    for i in range(simulations):
+        sim_seed = seed + i
+        shock_tape = _build_shock_tape_v111(scenario=scenario, mode_name=mode_name, years=years, seed=sim_seed)
+        sim_row = {"simulation": i + 1, "shared_seed": sim_seed}
+        finals = {}
+        for name, portfolio in portfolio_inputs.items():
+            result = simulate_portfolio(
+                portfolio, scenario, years, start_assets_twd, start_age, current_year,
+                salary_annual, salary_growth_pct, retirement_age,
+                tuotuozu_mode, tuotuozu_base_annual, tuotuozu_decay_pct,
+                tuotuozu_projection_list, tuotuozu_fallback_mode,
+                living_expense_annual, inflation_pct, edu_phase1_annual, edu_phase2_annual, mortgage_annual,
+                inheritance_age, inherited_rent_monthly, withdrawal_strategy, rebalance_frequency_years, mode_override,
+                seed=sim_seed, shock_tape=shock_tape,
+            )
+            final_assets = float(result.iloc[-1]["end_assets_twd"]) if not result.empty else 0.0
+            ruin_flag = int((result["uncovered_deficit_twd"] > 0).any() or (result["end_assets_twd"] <= 0).any()) if not result.empty else 1
+            max_drawdown = float(result["drawdown_pct"].min()) if not result.empty else -100.0
+            p_min_cash = float(result["cash_buffer_months"].min()) if not result.empty else 0.0
+            crash_years = int(result["crash_flag"].sum()) if not result.empty and "crash_flag" in result.columns else 0
+            bear_years = int(result["bear_flag"].sum()) if not result.empty and "bear_flag" in result.columns else 0
+            key = name.lower().replace("%", "pct").replace(" ", "_")
+            sim_row[f"{key}_final_assets_twd"] = final_assets
+            sim_row[f"{key}_ruin"] = ruin_flag
+            sim_row[f"{key}_max_drawdown_pct"] = max_drawdown
+            sim_row[f"{key}_min_cash_buffer_months"] = p_min_cash
+            sim_row[f"{key}_crash_years"] = crash_years
+            sim_row[f"{key}_bear_years"] = bear_years
+            finals[name] = final_assets
+        sim_row["recommended_beats_current"] = int(finals.get("Recommended", 0.0) > finals.get("Current", 0.0))
+        if "Custom" in finals:
+            sim_row["recommended_beats_custom"] = int(finals.get("Recommended", 0.0) > finals.get("Custom", 0.0))
+            sim_row["current_beats_custom"] = int(finals.get("Current", 0.0) > finals.get("Custom", 0.0))
+        rows.append(sim_row)
+
+    sims = pd.DataFrame(rows)
+    metrics: Dict[str, float] = {}
+    for name in portfolio_inputs:
+        key = name.lower().replace("%", "pct").replace(" ", "_")
+        final_col = f"{key}_final_assets_twd"
+        ruin_col = f"{key}_ruin"
+        drawdown_col = f"{key}_max_drawdown_pct"
+        metrics[f"{name} P50 終值"] = float(sims[final_col].median())
+        metrics[f"{name} P25 終值"] = float(sims[final_col].quantile(0.25))
+        metrics[f"{name} P75 終值"] = float(sims[final_col].quantile(0.75))
+        metrics[f"{name} P5 Worst Case 終值"] = float(sims[final_col].quantile(0.05))
+        metrics[f"{name} 資產耗盡機率"] = float(sims[ruin_col].mean() * 100.0)
+        metrics[f"{name} 最大回撤中位數"] = float(sims[drawdown_col].median())
+        metrics[f"{name} P5 最大回撤"] = float(sims[drawdown_col].quantile(0.05))
+    metrics["Recommended 勝過 Current 機率"] = float(sims["recommended_beats_current"].mean() * 100.0)
+    if "recommended_beats_custom" in sims.columns:
+        metrics["Recommended 勝過 Custom 機率"] = float(sims["recommended_beats_custom"].mean() * 100.0)
+    if "current_beats_custom" in sims.columns:
+        metrics["Current 勝過 Custom 機率"] = float(sims["current_beats_custom"].mean() * 100.0)
+    return sims, metrics
