@@ -734,3 +734,65 @@ simulation_id = 1
 
 > **幫 Ben 用資料看清楚自己的財務現況，規劃通往富足與自由的人生路線，並在家庭責任、教育費、事業現金流衰退、房貸槓桿與股票波動之間，找到長期勝率最高、最不容易中途出局的資產配置。**
 
+---
+
+## 附錄 A. ChatGPT + Codex 協作模式
+
+> 更新日期：2026-04-24
+
+本專案改採明確分工：
+
+```text
+Ben = PM / 最終決策者
+ChatGPT = 規格、財務邏輯、模型合理性、審查
+Codex = 程式修改、測試、diff、修 bug
+```
+
+### A.1 角色邊界
+
+| 角色 | 負責 | 不負責 |
+|---|---|---|
+| Ben | 目標、偏好、最終決策 | 逐行檢查程式 |
+| ChatGPT | 規格、邏輯、審查、模型合理性 | 未測試即宣稱程式可用 |
+| Codex | 修改程式、跑測試、整理 diff | 擅自改財務假設 |
+
+### A.2 必讀文件
+
+新一輪開發前，請先讀：
+
+1. `project_spec.md`
+2. `CODEX_HANDOFF.md`
+3. `CHATGPT_REVIEW_PROMPTS.md`
+4. `PROJECT_WORKFLOW.md`
+5. `financial_project_config.json`
+6. `financial_project_config.py`
+
+### A.3 開發原則
+
+1. 先修 crash，再加功能。
+2. 先建立 import contract，再重構 core/app。
+3. 財務假設不得由 Codex 擅自更改。
+4. 模型結果需標示：事實 / 推論 / 假設。
+5. Portfolio Lab 不可只看終值，必須看 P5、P50、P95、最大回撤、現金流壓力、AI/半導體曝險。
+6. 妥妥租收入以 Excel/CSV 預測表為主，貓狗企鵝 50%、鯰魚大大 100%。
+7. 2034 年 1.45 億已移除為硬目標，不得重新當作 base case。
+
+### A.4 Codex 最小驗收
+
+每次 Codex 交付至少需提供：
+
+```md
+## Changed Files
+## What Changed
+## Tests Run
+## Known Risks
+## Questions for Ben / ChatGPT
+```
+
+並至少跑：
+
+```bash
+python -m py_compile app.py core.py financial_project_config.py
+```
+
+如發生 ImportError / TypeError，優先修正 `app.py` 與 `core.py` 的函數 contract。
