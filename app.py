@@ -21,17 +21,26 @@ from core import (
     build_comparison,
     build_defensive_portfolio,
     build_recommended_portfolio,
+    build_candidate_portfolio,
+    build_dynamic_dca_plan,
+    build_life_stage_targets,
+    build_personal_balance_sheet,
+    build_voo_benchmark_portfolio,
     bucket_exposure,
     compute_etf_overlap,
     compute_risk_duplicate_metrics,
     default_control_values,
     get_scenario_row,
+    clean_moneybook_transactions,
     load_business_income_projection,
+    load_moneybook_accounts,
     load_positions,
+    load_tw_stock_positions,
     normalize_weights,
     run_monte_carlo_compare,
     scenario_table,
     simulate_portfolio,
+    summarize_monthly_spending,
     summarize_simulation,
 )
 
@@ -39,7 +48,26 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 SAMPLE_CSV = DATA_DIR / "Individual-Positions-2026-04-22-184253(1).csv"
 SAMPLE_BIZ_XLSX = DATA_DIR / "妥妥租_預測.xlsx"
+SAMPLE_BIZ_CSV = DATA_DIR / "妥妥租_資料庫 - [預測]未來十年稅後淨利表.csv"
+SAMPLE_BIZ_CSV_ROOT = BASE_DIR / "妥妥租_資料庫 - [預測]未來十年稅後淨利表.csv"
+
+SAMPLE_MB_ACCOUNTS = BASE_DIR / "Moneybook_帳戶_20260424_1.csv"
+SAMPLE_MB_TW_STOCKS = BASE_DIR / "Moneybook_台股證券手動新增庫存_20260424_1.csv"
+SAMPLE_MB_DETAIL = BASE_DIR / "Moneybook_明細_20260424_1.csv"
+SAMPLE_MB_BILLS = BASE_DIR / "Moneybook_帳單_20260424_1.csv"
+SAMPLE_MB_POLICIES = BASE_DIR / "Moneybook_保單_20260424_1.csv"
+
 SETTINGS_PATH = DATA_DIR / "user_saved_settings.json"
+
+
+def first_existing_path(*paths: Path) -> Path | None:
+    for p in paths:
+        if p is not None and Path(p).exists():
+            return Path(p)
+    return None
+
+
+DEFAULT_BIZ_SOURCE = first_existing_path(SAMPLE_BIZ_XLSX, SAMPLE_BIZ_CSV, SAMPLE_BIZ_CSV_ROOT)
 
 EXTERNAL_ASSUMPTIONS_DF = pd.DataFrame()
 EXTERNAL_ASSUMPTIONS_STATUS = "未匯入"
@@ -546,7 +574,7 @@ def build_validation_checks(current_df: pd.DataFrame, recommended_df: pd.DataFra
         salary_ok = float(post_ret.max()) == 0.0
     checks.append({"檢查項目": "本業收入退休後歸零", "結果": "PASS" if salary_ok else "FAIL", "說明": "退休後薪資應歸零"})
     if tuotuozu_mode == "Excel 預測":
-        checks.append({"檢查項目": "妥妥租 Excel 載入", "結果": "PASS" if len(biz_projection_list) > 0 else "FAIL", "說明": f"目前讀到 {len(biz_projection_list)} 年"})
+        checks.append({"檢查項目": "妥妥租預測表 載入", "結果": "PASS" if len(biz_projection_list) > 0 else "FAIL", "說明": f"目前讀到 {len(biz_projection_list)} 年"})
     edu_peak_ok = rec_res.loc[rec_res["calendar_year"].between(2034, 2038), "education_expense_twd"].max() >= edu_phase2_annual * 0.9
     checks.append({"檢查項目": "教育費高峰", "結果": "PASS" if edu_peak_ok else "WARNING", "說明": "2034-2038 應明顯高於前段"})
     drawdown_zero = bool((rec_res["drawdown_pct"].abs().max() == 0) and (rec_res["portfolio_return_pct"].abs().max() > 0))
@@ -934,11 +962,11 @@ def get_biz_excel_diagnostics(mode: str, source_mode: str | None, uploaded_file,
     notes: list[str] = []
     if mode != "Excel 預測":
         return notes
-    if source_mode == "使用內建範例 Excel":
-        notes.append(f"內建 Excel 路徑：{built_in_path}")
-        notes.append(f"內建 Excel 是否存在：{'是' if built_in_path.exists() else '否'}")
-    elif source_mode == "上傳 Excel":
-        notes.append(f"是否已上傳 Excel：{'是' if uploaded_file is not None else '否'}")
+    if source_mode == "使用內建範例預測表":
+        notes.append(f"內建預測表路徑：{built_in_path}")
+        notes.append(f"內建預測表是否存在：{'是' if built_in_path.exists() else '否'}")
+    elif source_mode == "上傳預測表":
+        notes.append(f"是否已上傳預測表：{'是' if uploaded_file is not None else '否'}")
     notes.append(f"openpyxl 是否可用：{'是' if openpyxl_available() else '否'}")
     notes.append(f"目前成功讀到的年度筆數：{len(projection_list)}")
     if projection_preview.empty:
@@ -1003,30 +1031,30 @@ with st.sidebar:
     retirement_age = st.number_input("退休年齡", min_value=45, max_value=90, value=int(saved.get("retirement_age", defaults["retirement_age"])), step=1, help="到了這個年齡，本業收入會歸零。")
 
     st.header("4) 妥妥租收入（遞減 / Excel）")
-    tuotuozu_mode = st.radio("妥妥租模式", ["手動遞減", "Excel 預測"], index=0 if saved.get("tuotuozu_mode", "手動遞減") == "手動遞減" else 1, help="手動遞減適合快速試算；Excel 預測適合沿用你原本的預測表。")
+    tuotuozu_mode = st.radio("妥妥租模式", ["手動遞減", "Excel 預測"], index=0 if saved.get("tuotuozu_mode", "Excel 預測") == "手動遞減" else 1, help="手動遞減適合快速試算；Excel 預測適合沿用你原本的預測表。")
     biz_projection_list, biz_projection_preview = [], pd.DataFrame(columns=["year", "net_profit_twd"])
-    biz_excel_source_mode = saved.get("biz_excel_source_mode", "使用內建範例 Excel")
+    biz_excel_source_mode = saved.get("biz_excel_source_mode", "使用內建範例預測表")
     uploaded_biz_excel = None
     biz_excel_error_message = ""
     if tuotuozu_mode == "Excel 預測":
-        biz_excel_source_mode = st.radio("妥妥租 Excel", ["使用內建範例 Excel", "上傳 Excel"], index=0 if saved.get("biz_excel_source_mode", "使用內建範例 Excel") == "使用內建範例 Excel" else 1, help="如果你 repo 的 data 裡有妥妥租_預測.xlsx，可直接用內建版本。")
-        uploaded_biz_excel = st.file_uploader("上傳 妥妥租_預測.xlsx", type=["xlsx"], key="uploaded_biz_excel")
+        biz_excel_source_mode = st.radio("妥妥租預測表", ["使用內建範例預測表", "上傳預測表"], index=0 if saved.get("biz_excel_source_mode", "使用內建範例預測表") == "使用內建範例預測表" else 1, help="如果你 repo 的 data 裡有妥妥租_預測.xlsx，可直接用內建版本。")
+        uploaded_biz_excel = st.file_uploader("上傳 妥妥租預測表（CSV/XLSX）", type=["xlsx", "xls", "csv"], key="uploaded_biz_excel")
         if not openpyxl_available():
             biz_excel_error_message = "目前環境缺少 openpyxl，pandas 無法讀取 .xlsx。請把 openpyxl 加進 requirements.txt 後重新部署。"
-        elif biz_excel_source_mode == "上傳 Excel":
+        elif biz_excel_source_mode == "上傳預測表":
             if uploaded_biz_excel is not None:
                 biz_projection_list, biz_projection_preview = cached_load_biz_projection(uploaded_biz_excel)
                 if len(biz_projection_list) == 0:
-                    biz_excel_error_message = "已上傳 Excel，但沒有成功解析出年度淨利資料。請檢查工作表名稱與欄位。"
+                    biz_excel_error_message = "已上傳預測表，但沒有成功解析出年度淨利資料。請檢查年份、團隊、稅後淨利欄位。"
             else:
-                biz_excel_error_message = "目前選擇『上傳 Excel』，但尚未上傳檔案。"
+                biz_excel_error_message = "目前選擇『上傳預測表』，但尚未上傳檔案。"
         else:
-            if SAMPLE_BIZ_XLSX.exists():
-                biz_projection_list, biz_projection_preview = cached_load_biz_projection(str(SAMPLE_BIZ_XLSX))
+            if DEFAULT_BIZ_SOURCE is not None and DEFAULT_BIZ_SOURCE.exists():
+                biz_projection_list, biz_projection_preview = cached_load_biz_projection(str(DEFAULT_BIZ_SOURCE))
                 if len(biz_projection_list) == 0:
-                    biz_excel_error_message = f"找到內建 Excel，但沒有成功解析內容：{SAMPLE_BIZ_XLSX}"
+                    biz_excel_error_message = f"找到內建預測表，但沒有成功解析內容：{DEFAULT_BIZ_SOURCE}"
             else:
-                biz_excel_error_message = f"找不到內建 Excel 檔案：{SAMPLE_BIZ_XLSX}"
+                biz_excel_error_message = f"找不到內建預測表檔案：{SAMPLE_BIZ_XLSX} 或 {SAMPLE_BIZ_CSV}"
     biz_excel_diagnostics = get_biz_excel_diagnostics(tuotuozu_mode, biz_excel_source_mode, uploaded_biz_excel, SAMPLE_BIZ_XLSX, biz_projection_list, biz_projection_preview)
     tuotuozu_base_annual = sidebar_number_input("妥妥租目前年度淨利", min_value=0.0, value=float(saved.get("tuotuozu_base_annual", defaults["tuotuozu_base_annual"])), step=100000.0, digits=1, help="當你不用 Excel 時，這個數字就是妥妥租收入的起點。")
     tuotuozu_decay_pct = sidebar_number_input("妥妥租年衰退率 %", min_value=-50.0, max_value=30.0, value=float(saved.get("tuotuozu_decay_pct", defaults["tuotuozu_decay_pct"])), step=0.5, digits=1, help="例如 10 代表每年衰退 10%。")
@@ -1052,7 +1080,7 @@ mcols[1].metric("Current 市值 (USD)", fmt_human(uploaded_total_usd, 1))
 mcols[2].metric("Current 市值折 TWD", fmt_human((uploaded_total_usd or 0) * fx_rate, 1))
 mcols[3].metric("建模起始資產", fmt_human(start_assets_twd, 1))
 mcols[4].metric("現金保留比重", f"{cash_reserve_target_pct:.1f}%")
-mcols[5].metric("妥妥租 Excel 年數", f"{len(biz_projection_list)}")
+mcols[5].metric("妥妥租預測表 年數", f"{len(biz_projection_list)}")
 
 if missing_fields:
     st.warning(f"CSV 缺少欄位：{', '.join(missing_fields)}。已用替代邏輯補足，但建議再檢查。")
@@ -1060,9 +1088,9 @@ else:
     st.success("CSV 欄位映射完整，可直接作為 Current Portfolio 基礎來源。")
 
 if tuotuozu_mode == "手動遞減":
-    st.info("目前使用「手動遞減」模式，因此妥妥租 Excel 不會被讀取。這不是壞掉，是你目前的設定。")
+    st.info("目前使用「手動遞減」模式，因此妥妥租預測表 不會被讀取。這不是壞掉，是你目前的設定。")
 elif len(biz_projection_list) > 0:
-    st.success(f"妥妥租 Excel 已成功載入，共 {len(biz_projection_list)} 年資料。")
+    st.success(f"妥妥租預測表 已成功載入，共 {len(biz_projection_list)} 年資料。")
 else:
     st.error("已切換到 Excel 預測模式，但目前沒有成功讀到資料。請檢查檔名、Excel 格式或重新上傳。")
 
@@ -1123,7 +1151,7 @@ scenario_name = default_scenario_name
 mode_override = "跟隨情境"
 mode_override_value = None
 
-main_tabs = st.tabs(["1. 輸入與持股編輯", "2. 儀表板", "3. 單一情境模擬", "4. 情境矩陣 / Monte Carlo", "5. 假設透明化 / LOG", "6. 驗證 / 除錯", "7. 原始資料與下載"])
+main_tabs = st.tabs(["1. 輸入與持股編輯", "2. 儀表板", "3. 單一情境模擬", "4. 情境矩陣 / Monte Carlo", "5. 假設透明化 / LOG", "6. 驗證 / 除錯", "7. 原始資料與下載", "8. 個人財務追蹤"])
 
 with main_tabs[0]:
     st.markdown("## 新手先看")
@@ -1140,7 +1168,7 @@ with main_tabs[0]:
   - Custom = 你自己改造後的版本
         """)
 
-    sub_tabs = st.tabs(["Current", "Recommended", "Custom", "Current vs Recommended", "妥妥租 Excel 預覽"])
+    sub_tabs = st.tabs(["Current", "Recommended", "Custom", "Current vs Recommended", "妥妥租預測表 預覽"])
     with sub_tabs[0]:
         current_readable = format_table_df(
             saved_current,
@@ -1214,7 +1242,7 @@ with main_tabs[0]:
             "salary_growth_pct": salary_growth_pct,
             "retirement_age": retirement_age,
             "tuotuozu_mode": tuotuozu_mode,
-            "biz_excel_source_mode": locals().get("biz_excel_source_mode", "使用內建範例 Excel"),
+            "biz_excel_source_mode": locals().get("biz_excel_source_mode", "使用內建範例預測表"),
             "tuotuozu_base_annual": tuotuozu_base_annual,
             "tuotuozu_decay_pct": tuotuozu_decay_pct,
             "tuotuozu_fallback_mode": tuotuozu_fallback_mode,
@@ -1450,7 +1478,7 @@ with main_tabs[2]:
     with viz_tabs[3]:
         st.plotly_chart(px.line(combo, x="calendar_year", y="drawdown_pct", color="portfolio", markers=True, title="最大回撤比較"), width="stretch")
     with viz_tabs[4]:
-        ai_prompt = f"""請根據以下模擬結果，做決策型分析，而不是只重述數字。\n\n【本次情境】\n{scenario_name}\n\n【我的目標】\n1. 長期勝率\n2. 不容易中途出局\n3. 教育費高峰時可承受\n4. 大跌時不容易被迫賣股\n5. 整體人生舒服度\n\n【輸入摘要】\n- 起始流動資產: {fmt_human(start_assets_twd,1)} TWD\n- 本業年薪: {fmt_human(salary_annual,1)}\n- 薪資成長率: {fmt_pct(salary_growth_pct,1)}\n- 退休年齡: {retirement_age}\n- 妥妥租模式: {tuotuozu_mode}\n- 妥妥租目前年度淨利: {fmt_human(tuotuozu_base_annual,1)}\n- 妥妥租衰退率: {fmt_pct(tuotuozu_decay_pct,1)}\n- 妥妥租 Excel 年數: {len(biz_projection_list)}\n- 基礎生活費/年: {fmt_human(living_expense_annual,1)}\n- 教育費 2026-2033/年: {fmt_human(edu_phase1_annual,1)}\n- 教育費 2034-2038/年: {fmt_human(edu_phase2_annual,1)}\n- 房貸/年: {fmt_human(mortgage_annual,1)}\n- 現金保留比重: {fmt_pct(cash_reserve_target_pct,1)}\n\n【結果摘要】\nCurrent: 最終資產 {fmt_human(cur_sum.get('最終資產終值'),1)} / 最大回撤 {fmt_pct(cur_sum.get('最大回撤 %'),1)} / 10年後 {fmt_human(cur_sum.get('10 年後淨資產'),1)} / 20年後 {fmt_human(cur_sum.get('20 年後淨資產'),1)} / 人生適配分數 {cur_sum.get('人生適配分數')}\nRecommended: 最終資產 {fmt_human(rec_sum.get('最終資產終值'),1)} / 最大回撤 {fmt_pct(rec_sum.get('最大回撤 %'),1)} / 10年後 {fmt_human(rec_sum.get('10 年後淨資產'),1)} / 20年後 {fmt_human(rec_sum.get('20 年後淨資產'),1)} / 人生適配分數 {rec_sum.get('人生適配分數')}\nCustom: 最終資產 {fmt_human(cus_sum.get('最終資產終值'),1)} / 最大回撤 {fmt_pct(cus_sum.get('最大回撤 %'),1)} / 10年後 {fmt_human(cus_sum.get('10 年後淨資產'),1)} / 20年後 {fmt_human(cus_sum.get('20 年後淨資產'),1)} / 人生適配分數 {cus_sum.get('人生適配分數')}\n\n【請回答】\n1. 先結論：哪個方案最適合我，為什麼？\n2. 分成：事實 / 推論 / 假設\n3. 一定要分析：最大回撤、現金流缺口、資產耗盡風險、人生適配分數\n4. 指出哪個方案比較像「賺得多但難撐」\n5. 指出哪個方案比較像「賺得稍慢但比較舒服」\n6. 若看到任何數據不合理，請提醒我先回頭驗模型\n"""
+        ai_prompt = f"""請根據以下模擬結果，做決策型分析，而不是只重述數字。\n\n【本次情境】\n{scenario_name}\n\n【我的目標】\n1. 長期勝率\n2. 不容易中途出局\n3. 教育費高峰時可承受\n4. 大跌時不容易被迫賣股\n5. 整體人生舒服度\n\n【輸入摘要】\n- 起始流動資產: {fmt_human(start_assets_twd,1)} TWD\n- 本業年薪: {fmt_human(salary_annual,1)}\n- 薪資成長率: {fmt_pct(salary_growth_pct,1)}\n- 退休年齡: {retirement_age}\n- 妥妥租模式: {tuotuozu_mode}\n- 妥妥租目前年度淨利: {fmt_human(tuotuozu_base_annual,1)}\n- 妥妥租衰退率: {fmt_pct(tuotuozu_decay_pct,1)}\n- 妥妥租預測表 年數: {len(biz_projection_list)}\n- 基礎生活費/年: {fmt_human(living_expense_annual,1)}\n- 教育費 2026-2033/年: {fmt_human(edu_phase1_annual,1)}\n- 教育費 2034-2038/年: {fmt_human(edu_phase2_annual,1)}\n- 房貸/年: {fmt_human(mortgage_annual,1)}\n- 現金保留比重: {fmt_pct(cash_reserve_target_pct,1)}\n\n【結果摘要】\nCurrent: 最終資產 {fmt_human(cur_sum.get('最終資產終值'),1)} / 最大回撤 {fmt_pct(cur_sum.get('最大回撤 %'),1)} / 10年後 {fmt_human(cur_sum.get('10 年後淨資產'),1)} / 20年後 {fmt_human(cur_sum.get('20 年後淨資產'),1)} / 人生適配分數 {cur_sum.get('人生適配分數')}\nRecommended: 最終資產 {fmt_human(rec_sum.get('最終資產終值'),1)} / 最大回撤 {fmt_pct(rec_sum.get('最大回撤 %'),1)} / 10年後 {fmt_human(rec_sum.get('10 年後淨資產'),1)} / 20年後 {fmt_human(rec_sum.get('20 年後淨資產'),1)} / 人生適配分數 {rec_sum.get('人生適配分數')}\nCustom: 最終資產 {fmt_human(cus_sum.get('最終資產終值'),1)} / 最大回撤 {fmt_pct(cus_sum.get('最大回撤 %'),1)} / 10年後 {fmt_human(cus_sum.get('10 年後淨資產'),1)} / 20年後 {fmt_human(cus_sum.get('20 年後淨資產'),1)} / 人生適配分數 {cus_sum.get('人生適配分數')}\n\n【請回答】\n1. 先結論：哪個方案最適合我，為什麼？\n2. 分成：事實 / 推論 / 假設\n3. 一定要分析：最大回撤、現金流缺口、資產耗盡風險、人生適配分數\n4. 指出哪個方案比較像「賺得多但難撐」\n5. 指出哪個方案比較像「賺得稍慢但比較舒服」\n6. 若看到任何數據不合理，請提醒我先回頭驗模型\n"""
         st.text_area("可直接複製給 AI 分析的 Prompt", value=ai_prompt, height=420)
         st.download_button("下載這次模擬的 AI Prompt", data=ai_prompt, file_name="ai_analysis_prompt.txt", mime="text/plain")
 
@@ -1673,3 +1701,118 @@ with main_tabs[6]:
             st.download_button("下載 Monte Carlo 明細 CSV", prepare_download(sims_df), "mc_detail.csv", "text/csv")
         except Exception:
             st.info("請先到『情境矩陣 / Monte Carlo』頁跑一次。")
+
+
+with main_tabs[7]:
+    st.markdown("## 個人財務追蹤 / Moneybook / 動態 DCA")
+    st.caption("這一頁把 Moneybook 帳戶、台股庫存、妥妥租預測表與投資組合放到同一個口徑下。目的不是完美會計，而是先建立可追蹤、可驗證、可迭代的個人財務儀表板。")
+
+    st.markdown("### A. 資產負債表輸入")
+    bcols = st.columns(4)
+    home_value_input = bcols[0].number_input("房產市值（TWD）", min_value=0.0, value=float(saved.get("home_value_twd", 8_500_000.0)), step=100_000.0, format="%.0f")
+    mortgage_input = bcols[1].number_input("房貸本金（TWD，interest-only）", min_value=0.0, value=float(saved.get("mortgage_principal_twd", 9_000_000.0)), step=100_000.0, format="%.0f")
+    hard_cash_reserve_input = bcols[2].number_input("硬安全水位（TWD）", min_value=0.0, value=float(saved.get("hard_cash_reserve_twd", 1_500_000.0)), step=50_000.0, format="%.0f")
+    current_rent_monthly_input = bcols[3].number_input("目前租金收入/月（TWD）", min_value=0.0, value=float(saved.get("current_rent_monthly_twd", 35_000.0)), step=5_000.0, format="%.0f")
+
+    mb_cols = st.columns(3)
+    uploaded_mb_accounts = mb_cols[0].file_uploader("上傳 Moneybook 帳戶 CSV", type=["csv"], key="uploaded_mb_accounts")
+    uploaded_mb_tw = mb_cols[1].file_uploader("上傳 Moneybook 台股庫存 CSV", type=["csv"], key="uploaded_mb_tw")
+    uploaded_mb_detail = mb_cols[2].file_uploader("上傳 Moneybook 明細 CSV", type=["csv"], key="uploaded_mb_detail")
+
+    accounts_source = uploaded_mb_accounts or (SAMPLE_MB_ACCOUNTS if SAMPLE_MB_ACCOUNTS.exists() else None)
+    tw_source = uploaded_mb_tw or (SAMPLE_MB_TW_STOCKS if SAMPLE_MB_TW_STOCKS.exists() else None)
+    detail_source = uploaded_mb_detail or (SAMPLE_MB_DETAIL if SAMPLE_MB_DETAIL.exists() else None)
+
+    accounts_df = load_moneybook_accounts(accounts_source) if accounts_source is not None else pd.DataFrame()
+    tw_stock_df = load_tw_stock_positions(tw_source) if tw_source is not None else pd.DataFrame()
+    us_assets_twd_for_bs = float(current_edited.get("market_value_usd", pd.Series(dtype=float)).sum() * fx_rate) if "market_value_usd" in current_edited.columns else float(start_assets_twd)
+
+    balance_sheet_df, bs_metrics = build_personal_balance_sheet(
+        accounts_df,
+        tw_stock_df,
+        us_assets_twd=us_assets_twd_for_bs,
+        fx_rate=fx_rate,
+        home_value_twd=home_value_input,
+        mortgage_twd=mortgage_input,
+        hard_cash_reserve_twd=hard_cash_reserve_input,
+    )
+
+    metric_cols = st.columns(6)
+    metric_cols[0].metric("總資產", fmt_human(bs_metrics.get("total_assets_twd"), 1))
+    metric_cols[1].metric("淨資產", fmt_human(bs_metrics.get("net_worth_twd"), 1))
+    metric_cols[2].metric("流動資產", fmt_human(bs_metrics.get("liquid_assets_twd"), 1))
+    metric_cols[3].metric("現金", fmt_human(bs_metrics.get("cash_twd"), 1))
+    metric_cols[4].metric("可投資現金", fmt_human(bs_metrics.get("investable_cash_twd"), 1))
+    metric_cols[5].metric("實質槓桿率", fmt_num(bs_metrics.get("leverage_ratio"), 2))
+
+    st.dataframe(format_table_df(balance_sheet_df, human_cols=["amount_twd"]), width="stretch", hide_index=True)
+
+    if not tw_stock_df.empty:
+        st.markdown("### B. 台股庫存")
+        st.dataframe(format_table_df(tw_stock_df, pct_cols=["weight_pct"], human_cols=["market_value_twd", "cost_basis_twd"]), width="stretch", hide_index=True)
+        tw_ai_weight = float(tw_stock_df.loc[tw_stock_df["ai_direct"], "market_value_twd"].sum() / max(tw_stock_df["market_value_twd"].sum(), 1) * 100)
+        st.info(f"台股 AI / 半導體供應鏈曝險約 {tw_ai_weight:.1f}%。這會和美股 AI 曝險疊加，不能只看美股。")
+    else:
+        st.warning("尚未讀到 Moneybook 台股庫存 CSV。")
+
+    st.markdown("### C. Moneybook 支出清理")
+    cleaned_tx = clean_moneybook_transactions(detail_source) if detail_source is not None else pd.DataFrame()
+    monthly_spending_df = summarize_monthly_spending(cleaned_tx)
+    if monthly_spending_df.empty:
+        st.info("尚未讀到 Moneybook 明細 CSV，因此先用左側『基礎生活費 / 年』作為支出估計。")
+        clean_monthly_spending = float(living_expense_annual) / 12.0
+    else:
+        st.dataframe(format_table_df(monthly_spending_df.tail(12), human_cols=["raw_expense_twd", "clean_personal_expense_twd", "business_like_expense_twd", "transfer_or_asset_move_twd"]), width="stretch", hide_index=True)
+        recent = monthly_spending_df.tail(6)
+        clean_monthly_spending = float(recent["clean_personal_expense_twd"].mean()) if not recent.empty else float(living_expense_annual) / 12.0
+        st.caption("clean_personal_expense_twd 已排除明顯信用卡繳款、轉帳、投資移轉與可能公司支出；仍需人工校正，尤其是公司/個人混用項目。")
+
+    st.markdown("### D. 妥妥租預測表認列結果")
+    if len(biz_projection_list) > 0 and not biz_projection_preview.empty:
+        st.success("目前以妥妥租預測表為主：貓狗企鵝認列 50%，鯰魚大大全額認列。")
+        st.dataframe(format_table_df(biz_projection_preview, human_cols=["net_profit_twd", "recognized_net_profit_twd"]), width="stretch", hide_index=True)
+        current_business_monthly = float(biz_projection_list[0]) / 12.0
+    else:
+        st.warning("目前沒有成功讀到妥妥租預測表。請在左側切換『Excel 預測』並上傳 CSV/XLSX，或放入 data 資料夾。")
+        current_business_monthly = 0.0
+
+    st.markdown("### E. 動態 DCA 建議")
+    monthly_income_est = float(salary_annual) / 12.0 + current_rent_monthly_input + current_business_monthly
+    manual_monthly_spending = st.number_input(
+        "用於 DCA 的月支出口徑（可用 Moneybook 清理值或手動覆蓋）",
+        min_value=0.0,
+        value=float(max(clean_monthly_spending, living_expense_annual / 12.0)),
+        step=5_000.0,
+        format="%.0f",
+    )
+    dca_df = build_dynamic_dca_plan(
+        monthly_income_twd=monthly_income_est,
+        monthly_base_expense_twd=manual_monthly_spending,
+        current_cash_twd=float(bs_metrics.get("cash_twd", 0.0) or 0.0),
+        hard_cash_reserve_twd=hard_cash_reserve_input,
+        next_12m_special_reserve_twd=0.0,
+        min_monthly_dca_twd=100_000.0,
+    )
+    dca_metrics = st.columns(4)
+    dca_metrics[0].metric("月收入估計", fmt_human(monthly_income_est, 1))
+    dca_metrics[1].metric("月支出估計", fmt_human(manual_monthly_spending, 1))
+    dca_metrics[2].metric("月剩餘現金流", fmt_human(max(0.0, monthly_income_est - manual_monthly_spending), 1))
+    dca_metrics[3].metric("建議 DCA", fmt_human(float(dca_df.loc[dca_df["mode"].eq("建議"), "monthly_dca_twd"].iloc[0]) if not dca_df.empty else 0.0, 1))
+    st.dataframe(format_table_df(dca_df, human_cols=["monthly_dca_twd"]), width="stretch", hide_index=True)
+
+    st.markdown("### F. 人生階段合理目標")
+    life_targets_df = build_life_stage_targets(
+        current_year=CURRENT_YEAR,
+        current_age=CURRENT_AGE,
+        total_assets_twd=float(bs_metrics.get("total_assets_twd", 26_000_000.0) or 26_000_000.0),
+        net_worth_twd=float(bs_metrics.get("net_worth_twd", 17_000_000.0) or 17_000_000.0),
+    )
+    st.dataframe(format_table_df(life_targets_df, human_cols=["total_assets_low_twd", "total_assets_high_twd", "net_worth_low_twd", "net_worth_high_twd"]), width="stretch", hide_index=True)
+
+    st.markdown("### G. 可視化開發重點")
+    st.markdown("""
+- **個人財務追蹤**：Moneybook 帳戶、台股、現金、房貸、房產、市值變化。
+- **現金流驗證**：妥妥租預測表、租金、薪資、生活費、教育費高峰。
+- **股票配比可視化**：Current / Recommended / Custom / Candidate / 100% VOO benchmark。
+- **決策核心**：不是追 2034 年 1.45 億，而是看每個階段的合理資產範圍、DCA 水位、P5 worst case、教育費高峰是否安全。
+""")

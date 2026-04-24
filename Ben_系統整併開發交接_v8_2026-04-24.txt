@@ -1,0 +1,49 @@
+# Ben 財務與投資模擬器 v8 整併交接摘要（2026-04-24）
+
+## 先結論
+本版已把 Ben 最新規則整併進原本 Streamlit 系統：妥妥租改以預測表為主、貓狗企鵝 50% 認列、鯰魚大大 100% 認列，並新增個人財務追蹤與 Moneybook 匯入骨架。系統目標從「股票配置模擬」擴充為「個人資產追蹤 + 股票配比可視化 + 動態 DCA」。
+
+## 已修改檔案
+- core.py
+- app.py
+- ben_financial_baseline_20260424.json
+- Ben 的狀況、目標、目前進度、待辦事項.txt
+- Ben 財務與投資模擬器的開發進度與已知問題.txt
+
+## 核心規則
+1. 妥妥租收入模式以 Excel/CSV 預測表為主。
+2. 忽略先前口述固定值：300 萬年淨利 / 30 萬月現金流。
+3. 團隊認列：
+   - 貓狗企鵝：50%
+   - 鯰魚大大：100%
+4. 200 萬 / 年為目前低消，不含 2034–2038 教育費高峰。
+5. 教育費高峰預設建議：
+   - 保守：60 萬 / 年
+   - 基準：90 萬 / 年
+   - 壓力：120 萬 / 年
+6. 房貸預設 interest-only。
+7. Moneybook 資料需清洗，公司與個人支出不可直接混算。
+8. 台股台積電須併入 AI/半導體曝險。
+
+## 新增核心函數
+- canonicalize_ticker()
+- load_business_income_projection()
+- load_tw_stock_positions()
+- load_moneybook_accounts()
+- build_personal_balance_sheet()
+- clean_moneybook_transactions()
+- summarize_monthly_spending()
+- build_dynamic_dca_plan()
+- build_life_stage_targets()
+- build_candidate_portfolio()
+- build_voo_benchmark_portfolio()
+
+## 新增 UI
+app.py 新增第 8 個 tab：「8. 個人財務追蹤」。
+
+## 下一步建議
+1. 將 Moneybook 清理規則做成可編輯規則表。
+2. 把 Candidate / 100% VOO benchmark 正式加進 Portfolio Lab。
+3. 把台股納入整體投資組合，而不是只在財務追蹤 tab 顯示。
+4. 將教育費從 phase1/phase2 擴充成 per-child schedule。
+5. Monte Carlo 改成共用 shock tape，讓各組合勝率比較更公平。

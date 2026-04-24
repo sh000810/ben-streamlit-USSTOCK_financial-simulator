@@ -1,0 +1,221 @@
+﻿以下是目前「Ben 財務與投資模擬器」的開發進度與已知問題。請你接手時不要從零開始，而是直接站在這個基礎上繼續。
+
+
+========================
+A. 目前工具已經做到的功能
+========================
+
+
+目前系統已有雛型，可做：
+
+
+1. Current / Recommended / Custom 三組組合比較
+2. 儀表板：
+- 資產配置圖
+- AI / 科技集中度圖
+- 風險摘要
+3. 單一情境模擬
+4. 情境矩陣 / Monte Carlo 頁面
+5. 驗證 / 除錯 tab
+6. 原始資料與下載
+7. Assumption Audit 骨架（已開始加入）
+
+
+========================
+B. 目前三組組合的大方向
+========================
+
+
+Current：
+- Ben 現有真實持股
+- AI / 科技 / 雲 / 半導體集中度較高
+- 含 QQQ / VOO / NVDA / MSFT / GOOG / AMZN / ASML / AVGO / NOW / ANET 等
+
+
+Recommended：
+- 比 Current 更整理過
+- 目標是降低重複風險，但仍保留 AI 成長主線
+- 仍屬偏成長型配置，不是極度保守
+
+
+Custom：
+- Ben 自己測試的更偏防守版
+- 現金 / VOO / BRK.B 占比提高
+- 更重視底盤穩定與防守
+
+
+========================
+C. 目前系統已知的重要改進
+========================
+
+
+近期版本已經修正或改善：
+
+
+1. Cash bucket 已修正為：
+- model_return_pct = 1.5
+- model_vol_pct = 0
+- 不再把現金當成股票
+
+
+2. current / recommended / custom 三組組合權重已確實進入模擬
+
+
+3. base_portfolio_return_pct / scenario_shift_pct / effective_portfolio_return_pct 的關係，
+在驗證包中已經能對得上：
+- effective = base + scenario_shift
+
+
+4. Assumption Audit 欄位骨架已經建立，包含：
+- hist_10y_cagr_pct
+- hist_10y_source
+- model_return_pct
+- model_return_method
+- vol_3y_weekly_pct
+- vol_5y_weekly_pct
+- model_vol_pct
+- model_vol_method
+- confidence
+- notes
+- classification_bucket
+- updated_at
+
+
+========================
+D. 目前最重要的問題
+========================
+
+
+請你接手時特別注意這些：
+
+
+1. historical assumptions 尚未真正完成
+- 多數股票仍然是：
+- hist_10y_cagr_pct = null
+- vol_3y_weekly_pct = null
+- vol_5y_weekly_pct = null
+- hist_10y_source = unavailable
+- confidence = low
+- 目前主要仍靠 bucket default / fallback 規則運作
+
+
+2. Monte Carlo 真實輸出仍不完整
+- global setting 有 monte_carlo_sims = 500
+- 但某些 validation bundle 裡，Monte Carlo 結果本身沒有真正 dump 出來
+- 目前可驗的多半還是 deterministic 單一路徑
+
+
+3. 最大回撤（drawdown）很可能還不夠可信
+- 某些結果出現回撤異常低
+- 這表示 drawdown 可能仍是平滑近似或公式代理值
+- 不能完全拿它當「真風險」使用
+
+
+4. UI 已可看方向，但還不能完全相信絕對數字
+- 可以比較趨勢、排序、組合結構
+- 但最終資產的精確數字，仍需要更多驗算
+
+
+========================
+E. 目前驗證過的結果（重要）
+========================
+
+
+在「AI 超級大牛市 / 20 年 / 起始資產 10.7M TWD」的驗證包中，可確認：
+
+
+1. 權重真的有進入模擬
+2. effective_return = base_return + scenario_shift
+3. Current 在 AI 大牛市中終值最高，Recommended 次之，Custom 最低
+4. 這個排序方向合理
+
+
+但目前還不能確認：
+- Monte Carlo 分布結果是否完整可信
+- 最大回撤是否真實反映風險
+- assumptions 是否已被歷史資料驗證完成
+
+
+========================
+F. 目前已建立的 historical assumptions 工作流
+========================
+
+
+工程師已提供：
+- historical_assumptions_template.csv
+
+
+目前已有一份第一版建議填值表，可作為：
+- hist_10y_cagr_pct
+- model_return_pct
+- model_return_method
+- model_vol_pct
+- model_vol_method
+- confidence
+- notes
+的手工補強基礎
+
+
+但注意：
+- 這些值目前仍屬「可驗證的前瞻假設」
+- 不是全部都已經由完整歷史價格資料自動計算得出
+
+
+========================
+G. 你接手後的主要工作
+========================
+
+
+你接手後，請優先做：
+
+
+1. 幫助判斷哪種持股配比更適合 Ben
+2. 用數據與模擬來證明：
+- Current / Recommended / Custom / 新方案
+- 哪種 long-term win rate 較高
+3. 協助檢查：
+- 歷史 assumptions 是否合理
+- 哪些 bucket default 應該被修正
+4. 幫助建立更可靠的驗算流程：
+- deterministic
+- Monte Carlo
+- validation logs
+5. 不要只給投資觀點，要能指出：
+- 哪些結果可信
+- 哪些結果只是暫時可用
+- 哪些結果需要更多資料才能成立
+
+
+========================
+2026-04-24 追加修正：妥妥租預測表、教育費、個人財務追蹤
+========================
+
+A. 妥妥租收入模式更新
+- 後續一律以「C. 匯入 Excel/CSV 預測表」為主。
+- 請忽略先前口述的「300 萬年淨利」或「30 萬月現金流」作為固定輸入。
+- 預測表中的團隊認列規則：
+  - 貓狗企鵝：稅後淨利只認列 50%。
+  - 鯰魚大大：稅後淨利全額認列 100%。
+- 系統已在 core.py 的 load_business_income_projection() 中套用 team recognition share，並輸出 team_recognition_audit 供驗算。
+
+B. 支出口徑與教育費
+- 目前 200 萬 / 年視為「現在低消」，不是未來教育費高峰。
+- 2034–2038 教育費高峰要獨立建模。
+- 使用情境：台北、兩個小孩、2026 年分別約 8 歲與 4 歲、公立學校、但有補習/安親/才藝。
+- 建議模型不要硬寫死單一數字，而是至少提供：
+  - 保守：600,000 / 年
+  - 基準：900,000 / 年
+  - 壓力：1,200,000 / 年
+- 系統目前仍保留 sidebar 可調 edu_phase1_annual / edu_phase2_annual。
+
+C. 系統方向更新
+- 本系統不只做股票投資模擬，也要逐步成為 Ben 個人資產追蹤系統。
+- 需要同時追蹤：Moneybook 帳戶、Moneybook 明細、Moneybook 台股庫存、美股券商 CSV、台幣現金、房產市值、房貸、妥妥租預測表、動態 DCA 可投入金額、股票配比與 AI/半導體曝險。
+- app.py 已新增「8. 個人財務追蹤」tab。
+- core.py 已新增個人財務追蹤與 Moneybook 解析函數。
+
+D. 重要開發提醒
+- Moneybook 明細不能直接視為個人支出，因為公司/個人支出混雜。
+- 系統目前會先排除明顯信用卡繳款、轉帳、投資移轉、妥妥租/QLAB/公司類支出，但仍需人工校正。
+- 台股持股中台積電比重很高，應併入 AI/半導體曝險，不可只看美股。
+- 房貸預設為 interest-only，時間到會申請延長；不能延長時再考慮轉銀行。

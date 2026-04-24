@@ -1,0 +1,85 @@
+{
+  "updated_at": "2026-04-24",
+  "currency": "TWD",
+  "asset_scope": "總資產 = 股票 + 現金 + 房產市值；另追蹤淨資產 = 總資產 - 房貸",
+  "current_assets": {
+    "us_portfolio_twd": 10700000,
+    "tw_stock_twd_moneybook": 2761390,
+    "twd_cash_user_stated": 4000000,
+    "twd_cash_moneybook_detected_excluding_house_stock_loan_credit": 3877642,
+    "home_market_value_user_stated": 8500000,
+    "home_market_value_moneybook": 8735938,
+    "mortgage_debt": 9000000,
+    "total_liquid_assets_estimated": 17461390,
+    "total_assets_user_scope": 25961390,
+    "net_assets_estimated": 16961390
+  },
+  "income_assumptions": {
+    "tuotuozu_personal_annual_net_profit": 3000000,
+    "tuotuozu_note": "使用者表示 300萬年淨利為個人可使用，已扣除合夥人；但同時口述每月30萬現金流，與300萬/年=25萬/月有口徑差異，系統需提供3.0M與3.6M切換。",
+    "rental_income_monthly": 35000,
+    "salary_monthly": 100000,
+    "default_gross_cashflow_monthly_using_3M_biz": 385000,
+    "default_gross_cashflow_monthly_using_3p6M_biz": 435000
+  },
+  "expense_assumptions": {
+    "base_annual_family_personal_mortgage_living_expense": 2000000,
+    "moneybook_low_floor_monthly_observed_by_user": 150000,
+    "moneybook_import_start_reliable_from": "2025-07",
+    "data_quality_notes": [
+      "公司消費與個人消費混在一起，個人消費會被高估",
+      "信用卡繳款/帳戶互轉/投資買賣需排除，否則重複計算",
+      "教育費高峰與醫療、稅金、旅遊等一次性費用需分層"
+    ]
+  },
+  "debt_assumptions": {
+    "mortgage_interest_only_preferred": true,
+    "mortgage_rate_pct": 2.2,
+    "annual_interest_estimate": 198000,
+    "monthly_interest_estimate": 16500,
+    "strategy": "永遠只繳利息；到期申請延長，不能延長則考慮轉銀行。模型需支援利息-only與轉貸情境。"
+  },
+  "cash_policy": {
+    "hard_cash_floor": 1500000,
+    "investable_cash_above_floor_initial_estimate": 2500000,
+    "recommended_dca_rule": "不是固定每月10萬，而是動態DCA：月可投資額=max(0, 收入-支出-安全水位調整-未來12個月特殊支出準備)。"
+  },
+  "tw_stock_holdings_moneybook": {
+    "2330_TSMC": 1726400,
+    "0050": 690800,
+    "6752_叡揚資訊": 344190
+  },
+  "moneybook_preliminary_findings_2025_07_to_2026_03": {
+    "candidate_personal_expense_avg_monthly_excluding_transfers_investments_credit_payments_business_tags": 294200,
+    "core_living_candidate_avg_monthly_excluding_tax_medical_travel_cash_other": 165728,
+    "selected_income_actual_avg_monthly_from_moneybook": 388125,
+    "note": "上述為初步粗分，不應直接當個人真實花費；需加入分類規則與人工排除公司支出。"
+  },
+  "goal_policy": {
+    "remove_2034_145m_target": true,
+    "planning_goal": "改為人生階段合理資產區間與達標機率，不再讓1.45億目標強迫模型推薦過度激進配置。"
+  },
+  "tuotuozu_income_mode": "Excel/CSV prediction table",
+  "ignore_prior_fixed_business_income": true,
+  "tuotuozu_team_recognition_rules": {
+    "貓狗企鵝": 0.5,
+    "鯰魚大大": 1.0
+  },
+  "expense_policy": {
+    "current_low_cost_annual_twd": 2000000,
+    "education_peak_2034_2038_is_additional_model_item": true,
+    "education_peak_public_school_plus_tutoring_taipei": {
+      "conservative_annual_twd": 600000,
+      "base_annual_twd": 900000,
+      "stress_annual_twd": 1200000
+    }
+  },
+  "system_scope": [
+    "personal balance sheet tracking",
+    "Moneybook account/detail/tw-stock ingestion",
+    "US portfolio ingestion",
+    "business income projection with team recognition",
+    "dynamic DCA planning",
+    "portfolio allocation and AI/semi exposure visualization"
+  ]
+}
